@@ -41,7 +41,7 @@ def _normalize_answer(text: str) -> str:
 
 
 def _detect_image_suffix(image_b64: str) -> tuple[str, str]:
-    raw = base64.b64decode(image_b64[:80] + "===")
+    raw = _safe_b64_decode(image_b64)[:16]
     if raw.startswith(b"\x89PNG"):
         return ".png", "image/png"
     if raw.startswith(b"\xff\xd8\xff"):
@@ -57,6 +57,11 @@ def _safe_b64_decode(image_b64: str) -> bytes:
         clean = clean.split(",", 1)[1]
     padding = "=" * (-len(clean) % 4)
     return base64.b64decode(clean + padding)
+
+
+def _safe_task_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "")
+    return safe.strip("._")[:120] or uuid.uuid4().hex[:8]
 
 
 class HarnessOrchestrator:
@@ -219,7 +224,7 @@ class HarnessOrchestrator:
     ) -> dict[str, Any]:
         max_steps = max_steps or self.config.max_steps
         trajectory_dir = trajectory_dir or self.config.trajectory_dir
-        task_id = case.task_id or str(uuid.uuid4())[:8]
+        task_id = _safe_task_id(case.task_id or str(uuid.uuid4())[:8])
         traj = Trajectory(task_id, output_dir=trajectory_dir)
         gate = ToolGateMiddleware(
             loop_limit=self.config.gate_loop_limit,

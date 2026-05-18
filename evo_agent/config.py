@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -11,42 +11,69 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: str) -> int:
+    return int(os.getenv(name, default))
+
+
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
 @dataclass
 class HarnessConfig:
-    """Environment-backed configuration with current harness-compatible names."""
+    """Environment-backed configuration with current harness-compatible names.
 
-    llm_base_url: str = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
-    model_name: str = os.getenv("MODEL_NAME", "qwen-3.5")
-    max_steps: int = int(os.getenv("MAX_STEPS", "20"))
-    max_tokens: int = int(os.getenv("MAX_TOKENS", "16000"))
-    temperature: float = float(os.getenv("TEMPERATURE", "1.0"))
-    disable_tools: bool = os.getenv("DISABLE_TOOLS", "0") == "1"
-    mock_llm: bool = os.getenv("MOCK_LLM", "0") == "1"
+    Defaults are read when the config instance is created, so tests and wrappers
+    can set environment variables immediately before constructing the harness.
+    """
 
-    trajectory_dir: str = os.getenv(
-        "TRAJECTORY_DIR", str(PACKAGE_ROOT / "trajectories")
+    llm_base_url: str = field(
+        default_factory=lambda: os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
     )
-    memory_db_path: str = os.getenv(
-        "MEMORY_DB_PATH", str(PACKAGE_ROOT / "memory.json")
-    )
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "qwen-3.5"))
+    max_steps: int = field(default_factory=lambda: _env_int("MAX_STEPS", "20"))
+    max_tokens: int = field(default_factory=lambda: _env_int("MAX_TOKENS", "16000"))
+    temperature: float = field(default_factory=lambda: _env_float("TEMPERATURE", "1.0"))
+    disable_tools: bool = field(default_factory=lambda: _env_bool("DISABLE_TOOLS", "0"))
+    mock_llm: bool = field(default_factory=lambda: _env_bool("MOCK_LLM", "0"))
 
-    reflection_enabled: bool = os.getenv("REFLECTION_ENABLED", "1") != "0"
-    reflection_model_enabled: bool = os.getenv("REFLECTION_MODEL_ENABLED", "0") == "1"
-    reflection_base_url: str = os.getenv(
-        "REFLECTION_LLM_BASE_URL", os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
+    trajectory_dir: str = field(
+        default_factory=lambda: os.getenv("TRAJECTORY_DIR", str(PACKAGE_ROOT / "trajectories"))
     )
-    reflection_model_name: str = os.getenv("REFLECTION_MODEL_NAME", "qwen-3-32b")
-    reflection_model_max_b: float = float(os.getenv("REFLECTION_MODEL_MAX_B", "32"))
-    reflection_api_key: str = os.getenv("REFLECTION_API_KEY", "EMPTY")
-    memory_model_enabled: bool = os.getenv("MEMORY_MODEL_ENABLED", os.getenv("REFLECTION_MODEL_ENABLED", "0")) == "1"
-
-    gate_loop_limit: int = int(os.getenv("GATE_LOOP_LIMIT", "3"))
-    gate_critical_limit: int = int(os.getenv("GATE_CRITICAL_LIMIT", "6"))
-    gate_similarity_threshold: float = float(
-        os.getenv("GATE_SIMILARITY_THRESHOLD", "0.85")
+    memory_db_path: str = field(
+        default_factory=lambda: os.getenv("MEMORY_DB_PATH", str(PACKAGE_ROOT / "memory.json"))
     )
 
-    result_dir: str = os.getenv("RESULT_DIR", str(PACKAGE_ROOT / "outputs"))
+    reflection_enabled: bool = field(default_factory=lambda: os.getenv("REFLECTION_ENABLED", "1") != "0")
+    reflection_model_enabled: bool = field(default_factory=lambda: _env_bool("REFLECTION_MODEL_ENABLED", "0"))
+    reflection_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "REFLECTION_LLM_BASE_URL",
+            os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+        )
+    )
+    reflection_model_name: str = field(
+        default_factory=lambda: os.getenv("REFLECTION_MODEL_NAME", "qwen-3-32b")
+    )
+    reflection_model_max_b: float = field(
+        default_factory=lambda: _env_float("REFLECTION_MODEL_MAX_B", "32")
+    )
+    reflection_api_key: str = field(default_factory=lambda: os.getenv("REFLECTION_API_KEY", "EMPTY"))
+    memory_model_enabled: bool = field(
+        default_factory=lambda: _env_bool("MEMORY_MODEL_ENABLED", os.getenv("REFLECTION_MODEL_ENABLED", "0"))
+    )
+
+    gate_loop_limit: int = field(default_factory=lambda: _env_int("GATE_LOOP_LIMIT", "3"))
+    gate_critical_limit: int = field(default_factory=lambda: _env_int("GATE_CRITICAL_LIMIT", "6"))
+    gate_similarity_threshold: float = field(
+        default_factory=lambda: _env_float("GATE_SIMILARITY_THRESHOLD", "0.85")
+    )
+
+    result_dir: str = field(default_factory=lambda: os.getenv("RESULT_DIR", str(PACKAGE_ROOT / "outputs")))
 
 
 def ensure_output_dirs(config: HarnessConfig) -> None:

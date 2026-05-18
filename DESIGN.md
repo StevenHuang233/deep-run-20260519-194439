@@ -85,6 +85,13 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - ExpeL：长期记忆不盲目 append，改为 `ADD/EDIT/IGNORE`，并用成功/失败结果做权重奖惩。
 - OpenClaw loop detection 文档：门禁层独立于 LLM，通过物理代码阻断重复工具调用和连续工具错误。
 
+## 第二轮鲁棒性优化
+
+- `HarnessConfig` 改为实例化时读取环境变量，避免测试或外部 wrapper 在 import 后设置环境变量却不生效。
+- base64 图片识别支持 `data:image/...;base64,...` 形式，便于单题 CLI、CSV 和多模态接口共用一条路径。
+- 轨迹文件名会清洗 `task_id`，避免用户传入包含路径分隔符或特殊字符的任务 ID。
+- 新增 `tests/test_interface_contracts.py`，用标准库 `unittest` 检查工具名、环境变量读取、32B 上限、图片 data URI 和输出 schema。
+
 ## 接口兼容性
 
 单题接口：
@@ -144,3 +151,11 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - 不做 LoRA/SFT 蒸馏。
 - 不改旧浏览器服务代码。
 - 不把参考仓库源码复制进本项目，只吸收公开设计模式。
+
+## 验证命令
+
+```bash
+python -m compileall -q .
+python -m unittest discover -s tests
+MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --output outputs/mock_predictions.jsonl
+```

@@ -66,3 +66,9 @@ MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 2 --output
 ```
 
 `MOCK_LLM=1` 只用于验证 CSV 解析、图片落盘、轨迹和输出格式；真实评测不要设置。
+
+接口契约测试：
+
+```bash
+python -m unittest discover -s tests
+```
