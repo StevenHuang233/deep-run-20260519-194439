@@ -32,10 +32,16 @@ class HarnessConfig:
 
     reflection_enabled: bool = os.getenv("REFLECTION_ENABLED", "1") != "0"
     reflection_model_enabled: bool = os.getenv("REFLECTION_MODEL_ENABLED", "0") == "1"
-    reflection_base_url: str = os.getenv("REFLECTION_LLM_BASE_URL", "")
+    reflection_base_url: str = os.getenv(
+        "REFLECTION_LLM_BASE_URL", os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1")
+    )
     reflection_model_name: str = os.getenv("REFLECTION_MODEL_NAME", "qwen-3-32b")
+    reflection_model_max_b: float = float(os.getenv("REFLECTION_MODEL_MAX_B", "32"))
+    reflection_api_key: str = os.getenv("REFLECTION_API_KEY", "EMPTY")
+    memory_model_enabled: bool = os.getenv("MEMORY_MODEL_ENABLED", os.getenv("REFLECTION_MODEL_ENABLED", "0")) == "1"
 
     gate_loop_limit: int = int(os.getenv("GATE_LOOP_LIMIT", "3"))
+    gate_critical_limit: int = int(os.getenv("GATE_CRITICAL_LIMIT", "6"))
     gate_similarity_threshold: float = float(
         os.getenv("GATE_SIMILARITY_THRESHOLD", "0.85")
     )

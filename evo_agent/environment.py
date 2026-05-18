@@ -11,9 +11,9 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-# Reuse the current tool modules directly, but import them lazily so local
-# validation can run without requests/openai installed. Real tool calls still
-# execute the original modules and therefore preserve service compatibility.
+# The current project already provides browser/search services. This module
+# keeps those modules as the single source of truth and only adapts OpenAI
+# tool-call JSON to their Python functions.
 
 
 TOOLS_SCHEMA = [
@@ -21,7 +21,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_text",
-            "description": "联网文本搜索，返回 [{rank,title,url,snippet,content?}]。",
+            "description": "Web text search. Returns a list of {rank,title,url,snippet,content?}.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -38,7 +38,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_image",
-            "description": "图搜文/反向图片搜索，返回 [{rank,title,url,snippet,content?}]。",
+            "description": "Reverse image search. Accepts image or image_url and returns ranked web results.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -56,7 +56,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "browser_navigate",
-            "description": "打开 URL，返回 {ok,url,title,wait_until,text_preview?,truncated?}。",
+            "description": "Open a URL through the existing browser service.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -78,7 +78,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "browser_get_text",
-            "description": "返回当前页面文本 {ok,url,title,text,truncated,total_chars}。",
+            "description": "Return text from the current browser page.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -93,7 +93,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "browser_click",
-            "description": "用 CSS selector 点击当前页元素。",
+            "description": "Click an element by CSS selector in the current browser page.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -109,7 +109,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "browser_type",
-            "description": "向 CSS selector 选中的输入框输入文本。",
+            "description": "Type into an input selected by CSS selector.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -127,7 +127,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "browser_parallel",
-            "description": "并发打开多个 URL，返回 list[dict]。",
+            "description": "Open or extract text from multiple URLs through the existing browser service.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -154,7 +154,7 @@ TOOLS_SCHEMA = [
 
 
 class ToolEnvironment:
-    """Dispatches OpenAI tool calls to Python functions."""
+    """Dispatch OpenAI tool calls to the existing Python tool functions."""
 
     def __init__(self) -> None:
         self.tool_map: dict[str, Callable[[dict[str, Any]], Any]] = {

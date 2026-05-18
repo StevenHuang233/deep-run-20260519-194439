@@ -82,7 +82,10 @@ class HarnessOrchestrator:
         self.compiler = CognitiveCompiler(
             ref_model=self.config.reflection_model_name,
             base_url=self.config.reflection_base_url,
-            enable_model=self.config.reflection_model_enabled,
+            api_key=self.config.reflection_api_key,
+            enable_model=self.config.reflection_model_enabled
+            or self.config.memory_model_enabled,
+            max_model_billion=self.config.reflection_model_max_b,
         )
         self.env = ToolEnvironment()
         self.client = None if self.config.mock_llm else self._create_openai_client()
@@ -221,6 +224,7 @@ class HarnessOrchestrator:
         gate = ToolGateMiddleware(
             loop_limit=self.config.gate_loop_limit,
             similarity_threshold=self.config.gate_similarity_threshold,
+            critical_limit=self.config.gate_critical_limit,
         )
 
         memory_rules = self.memory.retrieve_top_rules(case.instruction)
@@ -236,12 +240,16 @@ class HarnessOrchestrator:
         final_answer = ""
         failure_reason = ""
         steps_done = 0
+        api_calls = 0
+        total_tokens_accum = 0
+        exit_status = "unknown"
 
         for step in range(1, max_steps + 1):
             steps_done = step
             messages = traj.to_messages()
             if self.config.mock_llm:
                 final_answer = self._mock_answer(case)
+                exit_status = "submitted"
                 traj.write(
                     Role.ASSISTANT,
                     final_answer,
@@ -265,6 +273,7 @@ class HarnessOrchestrator:
                 if self.client is None:
                     raise RuntimeError("OpenAI client is unavailable")
                 response = self.client.chat.completions.create(**request_kwargs)
+                api_calls += 1
             except Exception as exc:
                 failure_reason = f"llm_call_failed: {type(exc).__name__}: {exc}"
                 traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=step)
@@ -276,6 +285,8 @@ class HarnessOrchestrator:
             reasoning_content = getattr(msg, "reasoning_content", None) or ""
             usage = getattr(response, "usage", None)
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
+            if total_tokens:
+                total_tokens_accum += int(total_tokens)
             tool_calls = None if self.config.disable_tools else getattr(msg, "tool_calls", None)
 
             extra: dict[str, Any] = {}
@@ -290,6 +301,7 @@ class HarnessOrchestrator:
             if not tool_calls:
                 if content:
                     final_answer = content
+                    exit_status = "submitted"
                     break
                 continue
 
@@ -320,12 +332,19 @@ class HarnessOrchestrator:
                     extra={"fn_name": fn_name, "fn_args": fn_args},
                 )
                 if blocked:
+                    exit_status = "gate_blocked"
                     break
             if blocked:
                 break
         else:
             failure_reason = f"max_steps_reached:{max_steps}"
             final_answer = "[HARNESS] Max steps reached. Last assistant message above."
+            exit_status = "limits_exceeded"
+
+        if failure_reason and exit_status == "unknown":
+            exit_status = "failed"
+        elif exit_status == "unknown":
+            exit_status = "submitted" if final_answer else "empty"
 
         success = self._judge_success(final_answer, case.answer)
         if case.answer and memory_rules:
@@ -343,8 +362,24 @@ class HarnessOrchestrator:
                 memory_write = self.memory.auto_dream_deduplication(
                     reflection.clin_rule,
                     self._memory_keywords(case, reflection),
+                    advisor=self.compiler.advise_memory_update
+                    if self.config.memory_model_enabled
+                    else None,
+                    task_instruction=case.instruction,
                 )
                 traj.write_event("memory_write", memory_write, step_id=steps_done)
+
+        traj.write_event(
+            "run_status",
+            {
+                "exit_status": exit_status,
+                "success": success,
+                "failure_reason": failure_reason,
+                "api_calls": api_calls,
+                "total_tokens": total_tokens_accum,
+            },
+            step_id=steps_done,
+        )
 
         return {
             "task_id": task_id,
@@ -355,6 +390,9 @@ class HarnessOrchestrator:
             "summary": traj.summary(),
             "success": success,
             "failure_reason": failure_reason,
+            "exit_status": exit_status,
+            "api_calls": api_calls,
+            "total_tokens": total_tokens_accum,
             "reflection": reflection_dict,
             "memory_write": memory_write,
             "applied_rules": memory_rules,
