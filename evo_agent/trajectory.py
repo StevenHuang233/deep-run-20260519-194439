@@ -1,0 +1,92 @@
+"""JSONL trajectory recording compatible with the provided harness format."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Optional
+
+from .types import Role
+
+
+class Trajectory:
+    """Append-only JSONL trajectory store.
+
+    The core fields match the provided harness:
+    timestamp, step_id, role, content, tool_call_id.
+    Extra reflection/memory events are stored with role="event" and are not
+    replayed back into the model context.
+    """
+
+    def __init__(self, task_id: str, output_dir: str = "trajectories") -> None:
+        self.task_id = task_id
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        self.path = out / f"{task_id}.jsonl"
+
+    def write(
+        self,
+        role: Role,
+        content,
+        step_id: Optional[int] = None,
+        tool_call_id: Optional[str] = None,
+        extra: Optional[dict] = None,
+    ) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "step_id": step_id,
+            "role": role.value,
+            "content": content,
+            "tool_call_id": tool_call_id,
+        }
+        if extra:
+            entry.update(extra)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def write_event(self, event_type: str, payload: dict, step_id: Optional[int]) -> None:
+        self.write(
+            Role.EVENT,
+            payload,
+            step_id=step_id,
+            extra={"event_type": event_type, "include_in_context": False},
+        )
+
+    def read_all(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        rows = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+        return rows
+
+    def to_messages(self) -> list[dict]:
+        messages = []
+        for entry in self.read_all():
+            if entry.get("include_in_context") is False:
+                continue
+            role = entry.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+            msg = {"role": role, "content": entry.get("content") or ""}
+            if role == "assistant" and entry.get("tool_calls"):
+                msg["tool_calls"] = entry["tool_calls"]
+            if entry.get("tool_call_id"):
+                msg["tool_call_id"] = entry["tool_call_id"]
+            messages.append(msg)
+        return messages
+
+    def summary(self) -> dict:
+        entries = self.read_all()
+        role_counts: dict[str, int] = {}
+        for item in entries:
+            role = item.get("role", "")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        return {
+            "task_id": self.task_id,
+            "total_turns": len(entries),
+            "role_counts": role_counts,
+            "path": str(self.path),
+        }
