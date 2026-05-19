@@ -1,0 +1,1 @@
+{"index": 0, "score": 0, "verdict": "incorrect", "reason": "judge_json_parse_failed:JSONDecodeError; fallback_exact_match=0", "instruction": "图中人物是哪一年因肺结核去世的？", "answer": "1934年", "pred": "1849年", "image": "/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets/simpleVQA/CCSimpleQA/82.jpg", "judge_model": "Qwen3-32B", "judge_attempts": 1}
