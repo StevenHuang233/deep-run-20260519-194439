@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from evo_agent.config import HarnessConfig
+from evo_agent.dreamer import MemoryDreamer
 from evo_agent.environment import ToolEnvironment
 from evo_agent.harness import HarnessOrchestrator, _detect_image_suffix
 from evo_agent.memory import SkepticalMemoryManager
@@ -340,6 +341,38 @@ class InterfaceContractTests(unittest.TestCase):
                 )
             self.assertEqual(len(memory.memory_db), 2)
             self.assertLessEqual(len(json.loads((Path(tmp) / "memory.json").read_text(encoding="utf-8"))), 2)
+
+    def test_dreamer_consolidates_failed_trajectory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            traj = Trajectory("failed_case", output_dir=str(root / "trajectories"))
+            traj.write(Role.SYSTEM, "system", step_id=0)
+            traj.write(Role.USER, "Which entity has the final attribute?", step_id=0)
+            traj.write(Role.ASSISTANT, "", step_id=1)
+            traj.write_event(
+                "run_status",
+                {
+                    "exit_status": "self_reflection_limits_exceeded",
+                    "success": False,
+                    "failure_reason": "empty_after_5_model_attempts",
+                },
+                step_id=5,
+            )
+            config = HarnessConfig(
+                mock_llm=True,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+                dream_report_path=str(root / "outputs" / "dream_report.json"),
+            )
+            dreamer = MemoryDreamer(config)
+            report = dreamer.run()
+            self.assertEqual(report["trajectories_reviewed"], 1)
+            self.assertEqual(report["failures_considered"], 1)
+            self.assertGreaterEqual(len(report["memory_updates"]), 1)
+            self.assertTrue((root / "outputs" / "dream_report.json").exists())
+            memory_rows = json.loads((root / "memory.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(memory_rows), 1)
 
 
 if __name__ == "__main__":

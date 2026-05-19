@@ -23,6 +23,8 @@ flowchart TD
     R --> I
     K --> L["Memory ADD/EDIT/IGNORE"]
     L --> M["memory.json"]
+    M --> O["MemoryDreamer 离线整理失败轨迹"]
+    O --> M
     I --> N["提交 JSONL + 轨迹 JSONL"]
 ```
 
@@ -81,6 +83,16 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 
 - 权重低于 `0.20` 的规则主动淘汰。
 
+### MemoryDreamer
+
+位置：`evo_agent/dreamer.py`
+
+- 离线读取最近 `trajectories/*.jsonl`，筛选失败、空答案、门禁阻断或异常退出样本。
+- 对失败轨迹调用 `CognitiveCompiler`，生成可迁移 CLIN 规则。
+- 通过 `SkepticalMemoryManager.auto_dream_deduplication()` 合并、去重和裁剪规则。
+- 写出 `dream_report.json`，记录 reviewed 数、失败数、memory updates 和 prune 结果。
+- 不参与当前 case 答案生成，不会写非模型 `pred`。
+
 ## 参考仓库对照后的优化
 
 - mini-swe-agent：吸收其“控制循环 + 轨迹状态 + exit_status/model_stats”思想，在轨迹末尾写入 `run_status` event。
@@ -114,6 +126,19 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - ExpeL 的经验提取和评测是分阶段的。本实现为了排行榜吞吐量，把“提取规则”和“本 case 使用规则”放进同一次 run，同时仍会把可泛化规则写入 `memory.json`。
 - 答案必须由主模型生成。优先级为：正常答案 > 反思恢复答案 > 空 `pred`；不会用 `unknown` 这类非模型文本兜底。
 
+## 第六轮模型答案约束
+
+- 撤销非模型 fallback 答案，`pred` 只能来自主模型生成内容。
+- 默认 `MIN_MODEL_ATTEMPTS=5`，首轮 ReAct 失败后至少追加 4 次单 case 反思恢复尝试。
+- 5 次模型尝试后仍没有可解析答案时，提交 JSONL 保持空 `pred`。
+
+## 第七轮 Dream Memory
+
+- 参考 AutoDream 的“后台批量记忆整理”模式，新增 `MemoryDreamer` 离线整理器。
+- 与 AutoDream 的三/五阶段 gate 思想对应，本实现采用手动触发或 `--dream-after-run`，只在批跑结束后整理，避免影响单题时延。
+- 整理过程分为 Orient（读取 memory 和轨迹）、Gather（筛失败轨迹）、Consolidate（编译 CLIN 规则并 ADD/EDIT/IGNORE）、Prune（按权重裁剪和写 report）。
+- 它只更新 `memory.json` 和 `dream_report.json`，不参与 `pred` 生成，因此不破坏“答案必须由模型生成”的约束。
+
 ## 接口兼容性
 
 单题接口：
@@ -144,6 +169,9 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - `MIN_MODEL_ATTEMPTS`
 - `CASE_REFLECTION_ATTEMPTS`
 - `CASE_REFLECTION_MAX_STEPS`
+- `DREAM_MAX_TRAJECTORIES`
+- `DREAM_MIN_FAILURES`
+- `DREAM_REPORT_PATH`
 
 搜索/浏览器接口：
 

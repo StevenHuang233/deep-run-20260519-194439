@@ -58,9 +58,18 @@ Commit: `16a17c7`
 
 ## Iteration 6: Model-Only Five Attempts
 
-Commit: this commit
+Commit: `6d6b7ee`
 
 - 按刷榜约束撤销非模型 fallback 答案，`pred` 只能来自主模型生成内容。
 - 默认 `MIN_MODEL_ATTEMPTS=5`，首轮 ReAct 失败后至少追加 4 次单 case 反思恢复尝试。
 - 5 次模型尝试后仍没有可解析答案时，提交 JSONL 保持空 `pred`。
 - 批量未捕获异常恢复为 `uncaught_*` 状态和空 `pred`，避免混入非模型答案。
+
+## Iteration 7: Dream Memory Consolidation
+
+Commit: this commit
+
+- 新增 `MemoryDreamer`，离线读取失败轨迹并整理成可泛化 CLIN 规则。
+- 新增 CLI：`--dream-memory` 手动整理，`--dream-after-run` 在批量运行后整理。
+- 新增 `dream_report.json`，记录 reviewed trajectories、failures、memory updates 和 prune 结果。
+- Dream Memory 只更新 `memory.json`，不会生成或填充 `pred`。

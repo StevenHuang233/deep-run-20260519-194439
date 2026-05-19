@@ -64,6 +64,11 @@ class HarnessConfig:
         default_factory=lambda: os.getenv("MEMORY_DB_PATH", str(PACKAGE_ROOT / "memory.json"))
     )
     memory_max_rules: int = field(default_factory=lambda: _env_int("MEMORY_MAX_RULES", "64"))
+    dream_max_trajectories: int = field(default_factory=lambda: _env_int("DREAM_MAX_TRAJECTORIES", "64"))
+    dream_min_failures: int = field(default_factory=lambda: _env_int("DREAM_MIN_FAILURES", "1"))
+    dream_report_path: str = field(
+        default_factory=lambda: os.getenv("DREAM_REPORT_PATH", str(PACKAGE_ROOT / "outputs" / "dream_report.json"))
+    )
 
     reflection_enabled: bool = field(default_factory=lambda: os.getenv("REFLECTION_ENABLED", "1") != "0")
     reflection_model_enabled: bool = field(default_factory=lambda: _env_bool("REFLECTION_MODEL_ENABLED", "0"))
@@ -97,3 +102,4 @@ def ensure_output_dirs(config: HarnessConfig) -> None:
     Path(config.trajectory_dir).mkdir(parents=True, exist_ok=True)
     Path(config.result_dir).mkdir(parents=True, exist_ok=True)
     Path(config.memory_db_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(config.dream_report_path).parent.mkdir(parents=True, exist_ok=True)

@@ -9,9 +9,11 @@ from pathlib import Path
 
 try:
     from evo_agent.config import HarnessConfig
+    from evo_agent.dreamer import MemoryDreamer
     from evo_agent.harness import HarnessOrchestrator, run_task
 except ImportError:
     from .evo_agent.config import HarnessConfig
+    from .evo_agent.dreamer import MemoryDreamer
     from .evo_agent.harness import HarnessOrchestrator, run_task
 
 
@@ -38,6 +40,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--start", type=int, default=0, help="Start index for batch run")
     p.add_argument("--resume", action="store_true", help="Append to output and skip existing indices")
     p.add_argument("--strict", action="store_true", help="Stop batch immediately on uncaught per-case errors")
+    p.add_argument("--dream-memory", action="store_true", help="Consolidate failed trajectories into memory")
+    p.add_argument("--dream-after-run", action="store_true", help="Run memory consolidation after a batch run")
+    p.add_argument("--dream-report", default=None, help="Dream memory report JSON path")
+    p.add_argument("--dream-limit", type=int, default=None, help="Max recent trajectories to review")
+    p.add_argument("--dream-min-failures", type=int, default=None, help="Minimum failed trajectories before writing memory")
     return p.parse_args()
 
 
@@ -62,6 +69,28 @@ def main() -> None:
         config.max_steps = args.max_steps
     if args.traj_dir:
         config.trajectory_dir = args.traj_dir
+    if args.dream_report:
+        config.dream_report_path = args.dream_report
+
+    def run_dream_memory() -> dict:
+        dreamer = MemoryDreamer(config)
+        report = dreamer.run(
+            trajectory_dir=args.traj_dir or config.trajectory_dir,
+            report_path=args.dream_report or config.dream_report_path,
+            limit=args.dream_limit,
+            min_failures=args.dream_min_failures,
+        )
+        print(
+            "Dream memory complete: "
+            f"{report['failures_considered']} failures, "
+            f"{len(report['memory_updates'])} memory updates"
+        )
+        print(f"Dream report: {args.dream_report or config.dream_report_path}")
+        return report
+
+    if args.dream_memory and not args.task_file:
+        run_dream_memory()
+        return
 
     if args.task_file:
         orch = HarnessOrchestrator(task_file=args.task_file, config=config)
@@ -75,6 +104,8 @@ def main() -> None:
         )
         print(f"Batch complete: {len(results)} cases")
         print(f"Output: {args.output or Path(config.result_dir) / 'predictions.jsonl'}")
+        if args.dream_after_run or args.dream_memory:
+            run_dream_memory()
         return
 
     if not args.instruction:

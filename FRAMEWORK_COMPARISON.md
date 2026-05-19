@@ -47,6 +47,7 @@
 | V4 | `9091f6e` | Batch Fault Tolerance | 单样本异常继续跑；`*.status.json`；Memory 上限裁剪 | 保留 |
 | V5 | `16a17c7` | Single-Case Reflection Retry | 同 case 失败后临时 CLIN 规则恢复；曾加入非模型 fallback | 反思恢复保留，非模型 fallback 废弃 |
 | V6 | `6d6b7ee` | Model-Only Five Attempts | 答案只能来自模型；默认至少 5 次模型尝试；仍失败则空 `pred` | 当前推荐版 |
+| V7 | 当前提交 | Dream Memory Consolidation | 离线读取失败轨迹，整理成 CLIN 规则，合并/裁剪 `memory.json` | 推荐批跑后使用 |
 
 ## 参考仓库框架对比
 
@@ -55,6 +56,7 @@
 | mini-swe-agent / SWE-agent | 极简 Agent 循环：query -> execute actions -> save trajectory -> exit status | 简洁控制循环、模型调用统计、轨迹保存、批量状态 | `run_status` event、API calls 统计、`--resume`、批量异常续跑 | 不采用其代码编辑环境和 SWE-bench 专用 patch 输出 |
 | CLIN | 交互后总结因果 memory，用 memory 快速适应新任务/新环境 | CLIN 单行因果规则、episode 内失败恢复、最近轨迹摘要 | `CognitiveCompiler` 生成 `Context -> Action is Necessary` 规则；同 case 临时规则恢复 | 不使用 ScienceWorld 环境，不做句向量动作映射 |
 | ExpeL | 收集经验 -> 抽取 insight -> 评测时召回；规则支持 ADD/EDIT/UPVOTE/DOWNVOTE/REMOVE | 自然语言经验库、规则合并、奖惩、淘汰 | `SkepticalMemoryManager` 的 `ADD/EDIT/IGNORE`、`UPVOTE/DOWNVOTE`、`MEMORY_MAX_RULES` | 不做完整离线 experience gathering / insight extraction 两阶段流水线 |
+| AutoDream / OpenClaw memory consolidation | 后台整理多轮 session memory | 定期整理、合并重复、删除陈旧规则、写整理报告 | `MemoryDreamer` 读取失败轨迹，生成规则并更新 `memory.json` / `dream_report.json` | 不做常驻后台任务，避免影响评测运行 |
 | OpenClaw / Tool Gate 类设计 | 工具调用层做死循环和错误拦截 | 物理门禁独立于 LLM，减少重复调用和 token 浪费 | `ToolGateMiddleware` 用 Jaccard 检测近似重复，追踪连续错误 | 没有复刻其全部工程实现，只吸收门禁思想 |
 | LLaMA-Factory | 统一 SFT / LoRA / 数据格式流水线 | 后续蒸馏训练可用 | 当前只保留轨迹数据可导出能力 | 暂不实现蒸馏 |
 
@@ -63,12 +65,12 @@
 - 从 0 构建，结构清晰，便于说明原创性和模块边界。
 - 不修改旧代码，降低破坏现有搜索/浏览器启动方式的风险。
 - 接口兼容：单题、批量、模型 API、搜索、浏览器环境变量都尽量沿用旧设计。
-- 同时具备跨任务进化和同 case 自救：Memory 用于后续任务，临时 CLIN 规则用于当前 case 恢复。
+- 同时具备跨任务进化、同 case 自救和离线 Dream Memory：Memory 用于后续任务，临时 CLIN 规则用于当前 case 恢复，Dreamer 用于批跑后清洗失败模式。
 - 符合当前约束：答案必须由模型生成；至少 5 次尝试；失败后空 `pred`。
 
 ## 当前框架的不足
 
-- 反思编译默认可启发式 fallback；如果没有真实 32B API，反思质量会弱于老师设想。
+- 反思和 Dream Memory 编译默认可启发式 fallback；如果没有真实 32B API，记忆质量会弱于老师设想。
 - Skeptical Memory 目前是关键词检索，不是向量检索，速度快但召回能力有限。
 - 多角色 MAR 审计法庭尚未完整实现，目前是单编译器接口。
 - 未做蒸馏训练链路，轨迹只是先按 JSONL 保存。

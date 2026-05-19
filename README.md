@@ -80,6 +80,30 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl --strict
 ```
 
+## Dream Memory 离线整理
+
+参考 AutoDream 的批量记忆整理思路，系统提供离线 `MemoryDreamer`：读取最近失败轨迹，生成可泛化 CLIN 规则，合并/裁剪 `memory.json`，并写出 `dream_report.json`。它不参与单题答题，也不会填充 `pred`。
+
+手动整理：
+
+```bash
+python -m task_runner --dream-memory --traj-dir trajectories --dream-report outputs/dream_report.json
+```
+
+批量运行后自动整理：
+
+```bash
+python -m task_runner --task-file ../benchmark.csv --output outputs/benchmark_predictions.jsonl --dream-after-run
+```
+
+可调参数：
+
+```bash
+export DREAM_MAX_TRAJECTORIES=64
+export DREAM_MIN_FAILURES=1
+export DREAM_REPORT_PATH=outputs/dream_report.json
+```
+
 `benchmark.csv` 中的 base64 图片会落到 `outputs/benchmark_images/`，用于模型视觉输入和 `search_image` 本地文件上传；输出 JSONL 仍保留原始 `image` 字段。
 
 输出 JSONL 遵循提交格式：
