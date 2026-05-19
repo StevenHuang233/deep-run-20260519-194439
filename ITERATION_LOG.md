@@ -40,9 +40,18 @@ Commit: `f9d54f9`
 
 ## Iteration 4: Batch Fault Tolerance And Memory Pruning
 
-Commit: this commit
+Commit: `9091f6e`
 
 - 参考 mini-swe-agent 的 per-instance exception handling，批量默认单样本失败后继续跑。
 - 为预测 JSONL 旁路生成 `*.status.json`，记录 exit status、API calls 和 token 汇总。
 - 参考 ExpeL 的 bounded rule list，新增 `MEMORY_MAX_RULES` 并自动裁剪低价值规则。
 - 扩展接口契约测试，覆盖批量异常续跑和 Memory 裁剪。
+
+## Iteration 5: Single-Case Reflection Retry And Non-Empty Pred
+
+Commit: this commit
+
+- 参考 CLIN 的 episode 内小预算恢复，把失败轨迹即时编译成临时 CLIN 规则，并在同一个 case 内追加短 ReAct 重试。
+- 参考 mini-swe-agent 的可追踪 exit/submission 模式，在轨迹中记录 `self_reflection_retry_start`、`self_reflection_retry_status` 和最终 `run_status`。
+- 保留 ExpeL 风格长期记忆写入；同 case 恢复使用的规则也会参与后续奖惩。
+- 默认 `ALWAYS_ANSWER=1`，正常答案和反思恢复都失败时才写入 `FALLBACK_ANSWER`，保证提交 JSONL 的 `pred` 非空。

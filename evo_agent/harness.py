@@ -416,13 +416,78 @@ class HarnessOrchestrator:
         elif exit_status == "unknown":
             exit_status = "submitted" if final_answer else "empty"
 
-        success = self._judge_success(final_answer, case.answer)
-        if case.answer and memory_rules:
-            self.memory.apply_expel_reward(memory_rules, success)
-
+        applied_rules = list(memory_rules)
         reflection_dict = None
         memory_write = None
-        if self.config.reflection_enabled and (failure_reason or (case.answer and not success)):
+
+        if self.config.reflection_enabled and self._should_reflection_retry(
+            final_answer, failure_reason, exit_status, case.answer
+        ):
+            for retry_no in range(1, max(0, self.config.case_reflection_attempts) + 1):
+                reflection = self.compiler.compile_failed_trace(
+                    traj.read_all(), case.instruction
+                )
+                reflection_dict = reflection.as_dict()
+                reflection_dict["retry_attempt"] = retry_no
+                traj.write_event("reflection", reflection_dict, step_id=steps_done)
+
+                retry_rule = reflection.clin_rule
+                if reflection.memory_worthy:
+                    memory_write = self.memory.auto_dream_deduplication(
+                        retry_rule,
+                        self._memory_keywords(case, reflection),
+                        advisor=self.compiler.advise_memory_update
+                        if self.config.memory_model_enabled
+                        else None,
+                        task_instruction=case.instruction,
+                    )
+                    retry_rule = str(memory_write.get("rule") or retry_rule)
+                    traj.write_event("memory_write", memory_write, step_id=steps_done)
+                if retry_rule:
+                    applied_rules.append(retry_rule)
+
+                retry_result = self._run_reflection_retry(
+                    case=case,
+                    traj=traj,
+                    reflection=reflection,
+                    start_step=steps_done,
+                    retry_no=retry_no,
+                )
+                steps_done = int(retry_result["steps_done"])
+                api_calls += int(retry_result["api_calls"])
+                total_tokens_accum += int(retry_result["total_tokens"])
+                if retry_result["answer"]:
+                    final_answer = str(retry_result["answer"])
+                if retry_result["failure_reason"]:
+                    failure_reason = self._append_reason(
+                        failure_reason, str(retry_result["failure_reason"])
+                    )
+                exit_status = str(retry_result["exit_status"] or exit_status)
+                if self._has_parseable_prediction(final_answer):
+                    break
+
+        final_answer, fallback_used = self._ensure_answer_text(
+            final_answer, "case ended without a parseable prediction"
+        )
+        if fallback_used:
+            failure_reason = self._append_reason(failure_reason, "fallback_answer_used")
+            if exit_status in {"empty", "failed", "limits_exceeded", "gate_blocked", "unknown"}:
+                exit_status = f"{exit_status}_fallback" if exit_status != "unknown" else "fallback_answer"
+            traj.write_event(
+                "fallback_answer",
+                {"pred": self.extract_pred(final_answer), "reason": failure_reason},
+                step_id=steps_done,
+            )
+
+        success = self._judge_success(final_answer, case.answer) and not fallback_used
+        if case.answer and applied_rules:
+            self.memory.apply_expel_reward(applied_rules, success)
+
+        if (
+            reflection_dict is None
+            and self.config.reflection_enabled
+            and (failure_reason or (case.answer and not success))
+        ):
             reflection = self.compiler.compile_failed_trace(
                 traj.read_all(), case.instruction
             )
@@ -465,7 +530,185 @@ class HarnessOrchestrator:
             "total_tokens": total_tokens_accum,
             "reflection": reflection_dict,
             "memory_write": memory_write,
-            "applied_rules": memory_rules,
+            "applied_rules": applied_rules,
+        }
+
+    def _should_reflection_retry(
+        self, final_answer: str, failure_reason: str, exit_status: str, gold_answer: str = ""
+    ) -> bool:
+        if self.config.case_reflection_attempts <= 0:
+            return False
+        if gold_answer and self._has_parseable_prediction(final_answer):
+            return not self._judge_success(final_answer, gold_answer)
+        if self._has_parseable_prediction(final_answer) and not failure_reason:
+            return False
+        if exit_status in {"submitted", "self_reflection_submitted"} and self._has_parseable_prediction(final_answer):
+            return False
+        return True
+
+    def _run_reflection_retry(
+        self,
+        case: TaskCase,
+        traj: Trajectory,
+        reflection: Reflection,
+        start_step: int,
+        retry_no: int,
+    ) -> dict[str, Any]:
+        """Retry the same case with a temporary CLIN rule before falling back."""
+        max_steps = max(0, self.config.case_reflection_max_steps)
+        gate = ToolGateMiddleware(
+            loop_limit=self.config.gate_loop_limit,
+            similarity_threshold=self.config.gate_similarity_threshold,
+            critical_limit=self.config.gate_critical_limit,
+        )
+        retry_prompt = (
+            "[SELF_REFLECTION_RETRY]\n"
+            f"Attempt {retry_no} is a recovery attempt for the same task.\n"
+            f"Failure type: {reflection.failure_type}\n"
+            f"Root cause: {reflection.root_cause}\n"
+            f"Temporary guideline: {reflection.clin_rule}\n"
+            "Use the guideline as a skeptical hint. Avoid repeating blocked or unhelpful tool calls. "
+            "If enough evidence is already available, answer immediately. "
+            "Return exactly one concise final response wrapped as <answer>...</answer>."
+        )
+        user_step = start_step + 1
+        traj.write_event(
+            "self_reflection_retry_start",
+            {"retry_attempt": retry_no, "max_steps": max_steps, "clin_rule": reflection.clin_rule},
+            step_id=start_step,
+        )
+        traj.write(Role.USER, retry_prompt, step_id=user_step)
+
+        final_answer = ""
+        failure_reason = ""
+        exit_status = "self_reflection_empty"
+        api_calls = 0
+        total_tokens_accum = 0
+        steps_done = user_step
+
+        for offset in range(1, max_steps + 1):
+            step_id = user_step + offset
+            steps_done = step_id
+            if self.config.mock_llm:
+                final_answer = self._mock_answer(case)
+                exit_status = "self_reflection_submitted"
+                traj.write(
+                    Role.ASSISTANT,
+                    final_answer,
+                    step_id=step_id,
+                    extra={"reasoning_content": "MOCK_LLM self-reflection retry path."},
+                )
+                break
+
+            request_kwargs = {
+                "model": self.config.model_name,
+                "messages": traj.to_messages(recent_steps=self.config.context_recent_steps),
+                "max_tokens": self.config.max_tokens,
+                "temperature": max(0.2, min(self.config.temperature, 0.8)),
+                "extra_body": {"enable_thinking": True},
+            }
+            if not self.config.disable_tools:
+                request_kwargs["tools"] = self.env.schemas
+                request_kwargs["tool_choice"] = "auto"
+
+            try:
+                if self.client is None:
+                    raise RuntimeError("OpenAI client is unavailable")
+                response, attempts = self._call_llm_with_retry(request_kwargs)
+                api_calls += attempts
+            except LLMCallFailure as exc:
+                api_calls += exc.attempts
+                failure_reason = f"self_reflection_llm_failed: {type(exc).__name__}: {exc}"
+                traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=step_id)
+                exit_status = "self_reflection_failed"
+                break
+            except Exception as exc:
+                failure_reason = f"self_reflection_llm_failed: {type(exc).__name__}: {exc}"
+                traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=step_id)
+                exit_status = "self_reflection_failed"
+                break
+
+            choice = response.choices[0]
+            msg = choice.message
+            content = getattr(msg, "content", None) or ""
+            reasoning_content = getattr(msg, "reasoning_content", None) or ""
+            usage = getattr(response, "usage", None)
+            total_tokens = getattr(usage, "total_tokens", None) if usage else None
+            if total_tokens:
+                total_tokens_accum += int(total_tokens)
+            tool_calls = None if self.config.disable_tools else getattr(msg, "tool_calls", None)
+
+            extra: dict[str, Any] = {}
+            if tool_calls:
+                extra["tool_calls"] = [self._dump_tool_call(tc) for tc in tool_calls]
+            if reasoning_content:
+                extra["reasoning_content"] = reasoning_content
+            if total_tokens:
+                extra["total_tokens"] = total_tokens
+            traj.write(Role.ASSISTANT, content, step_id=step_id, extra=extra or None)
+
+            if not tool_calls:
+                if content:
+                    final_answer = content
+                    exit_status = "self_reflection_submitted"
+                    break
+                continue
+
+            blocked = False
+            for tc in tool_calls:
+                fn_name, fn_args, tc_id = self._parse_tool_call(tc)
+                try:
+                    gate.inspect_call(fn_name, fn_args)
+                    raw_result = self.env.dispatch(fn_name, fn_args)
+                    error = self.env.result_error(raw_result)
+                    if error:
+                        gate.track_error(fn_name, error)
+                    tool_result = self.env.serialize_result(raw_result)
+                except ToolGateBlocked as exc:
+                    failure_reason = f"self_reflection_gate_blocked: {exc}"
+                    tool_result = _json_dumps({"ok": False, "error": failure_reason})
+                    blocked = True
+                except Exception as exc:
+                    failure_reason = f"self_reflection_tool_failed: {type(exc).__name__}: {exc}"
+                    tool_result = _json_dumps({"ok": False, "error": failure_reason})
+                    blocked = True
+
+                traj.write(
+                    Role.TOOL,
+                    tool_result,
+                    step_id=step_id,
+                    tool_call_id=tc_id,
+                    extra={"fn_name": fn_name, "fn_args": fn_args},
+                )
+                if blocked:
+                    exit_status = "self_reflection_gate_blocked"
+                    break
+            if blocked:
+                break
+        else:
+            if not final_answer:
+                failure_reason = f"self_reflection_max_steps_reached:{max_steps}"
+                exit_status = "self_reflection_limits_exceeded"
+
+        traj.write_event(
+            "self_reflection_retry_status",
+            {
+                "retry_attempt": retry_no,
+                "exit_status": exit_status,
+                "pred": self.extract_pred(final_answer),
+                "failure_reason": failure_reason,
+                "api_calls": api_calls,
+                "total_tokens": total_tokens_accum,
+            },
+            step_id=steps_done,
+        )
+        return {
+            "answer": final_answer,
+            "steps_done": steps_done,
+            "failure_reason": failure_reason,
+            "exit_status": exit_status,
+            "api_calls": api_calls,
+            "total_tokens": total_tokens_accum,
         }
 
     def _build_user_content(self, case: TaskCase) -> Any:
@@ -521,6 +764,23 @@ class HarnessOrchestrator:
     def extract_pred(self, answer: str) -> str:
         return _normalize_answer(answer) or answer.strip()
 
+    def _has_parseable_prediction(self, answer: str) -> bool:
+        stripped = (answer or "").strip()
+        return bool(self.extract_pred(answer)) and not stripped.upper().startswith("[HARNESS]")
+
+    def _ensure_answer_text(self, answer: str, reason: str = "") -> tuple[str, bool]:
+        if not self.config.always_answer:
+            return answer, False
+        if self._has_parseable_prediction(answer):
+            return answer, False
+        fallback = (self.config.fallback_answer or "unknown").strip() or "unknown"
+        return f"<answer>{fallback}</answer>", True
+
+    def _append_reason(self, current: str, extra: str) -> str:
+        if current:
+            return f"{current}; {extra}"
+        return extra
+
     def _mock_answer(self, case: TaskCase) -> str:
         if case.answer:
             return f"<answer>{case.answer}</answer>"
@@ -551,6 +811,8 @@ class HarnessOrchestrator:
         answer: str,
         image: str = "",
     ) -> None:
+        if self.config.always_answer and not str(pred or "").strip():
+            pred = (self.config.fallback_answer or "unknown").strip() or "unknown"
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "a", encoding="utf-8") as f:
             f.write(
@@ -597,16 +859,27 @@ class HarnessOrchestrator:
                 if not continue_on_error:
                     raise
                 logger.error("case %s failed with uncaught exception: %s", case.task_id, exc, exc_info=True)
+                fallback_answer, _ = self._ensure_answer_text(
+                    "", f"uncaught_{type(exc).__name__}"
+                )
+                fallback_pred = self.extract_pred(fallback_answer)
                 result = {
                     "task_id": case.task_id or f"case_{case.index}",
-                    "answer": "",
-                    "pred": "",
+                    "answer": fallback_answer,
+                    "pred": fallback_pred,
                     "steps": 0,
                     "trajectory_path": "",
                     "summary": {},
                     "success": False,
-                    "failure_reason": f"{type(exc).__name__}: {exc}",
-                    "exit_status": f"uncaught_{type(exc).__name__}",
+                    "failure_reason": self._append_reason(
+                        f"{type(exc).__name__}: {exc}",
+                        "fallback_answer_used" if fallback_pred else "",
+                    ).strip("; "),
+                    "exit_status": (
+                        f"uncaught_{type(exc).__name__}_fallback"
+                        if fallback_pred
+                        else f"uncaught_{type(exc).__name__}"
+                    ),
                     "api_calls": 0,
                     "total_tokens": 0,
                     "reflection": None,

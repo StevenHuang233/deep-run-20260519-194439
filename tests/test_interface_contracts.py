@@ -14,7 +14,7 @@ from evo_agent.harness import HarnessOrchestrator, _detect_image_suffix
 from evo_agent.memory import SkepticalMemoryManager
 from evo_agent.model_policy import assert_model_within_limit
 from evo_agent.trajectory import Trajectory
-from evo_agent.types import Role
+from evo_agent.types import Role, TaskCase
 
 
 class InterfaceContractTests(unittest.TestCase):
@@ -157,6 +157,63 @@ class InterfaceContractTests(unittest.TestCase):
             self.assertEqual(response, {"ok": True})
             self.assertEqual(attempts, 3)
 
+    def test_single_case_reflection_retry_recovers_empty_prediction(self) -> None:
+        class _Message:
+            def __init__(self, content: str) -> None:
+                self.content = content
+                self.tool_calls = None
+                self.reasoning_content = ""
+
+        class _Choice:
+            def __init__(self, content: str) -> None:
+                self.message = _Message(content)
+
+        class _Response:
+            def __init__(self, content: str) -> None:
+                self.choices = [_Choice(content)]
+                self.usage = None
+
+        class _Completions:
+            def __init__(self) -> None:
+                self.contents = ["", "<answer>Recovered</answer>"]
+
+            def create(self, **_kwargs):
+                return _Response(self.contents.pop(0))
+
+        class _Chat:
+            def __init__(self) -> None:
+                self.completions = _Completions()
+
+        class _Client:
+            def __init__(self) -> None:
+                self.chat = _Chat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = HarnessConfig(
+                mock_llm=True,
+                max_steps=1,
+                case_reflection_attempts=1,
+                case_reflection_max_steps=1,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = HarnessOrchestrator(config=config)
+            orch.config.mock_llm = False
+            orch.client = _Client()
+            result = orch.run_case(
+                TaskCase(index=0, instruction="Need an answer", answer="Recovered", task_id="retry")
+            )
+            events = [
+                row.get("event_type")
+                for row in Path(result["trajectory_path"]).read_text(encoding="utf-8").splitlines()
+                for row in [json.loads(row)]
+            ]
+            self.assertEqual(result["pred"], "recovered")
+            self.assertEqual(result["exit_status"], "self_reflection_submitted")
+            self.assertIn("self_reflection_retry_start", events)
+
     def test_batch_continues_on_uncaught_case_error(self) -> None:
         class _FailingOrchestrator(HarnessOrchestrator):
             def run_case(self, case, max_steps=None, trajectory_dir=None):
@@ -198,9 +255,25 @@ class InterfaceContractTests(unittest.TestCase):
             rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
             status = json.loads((root / "predictions.jsonl.status.json").read_text(encoding="utf-8"))
             self.assertEqual(len(results), 2)
-            self.assertEqual(rows[0]["pred"], "")
+            self.assertEqual(rows[0]["pred"], "unknown")
             self.assertEqual(rows[1]["pred"], "b")
-            self.assertEqual(status["exit_status_counts"]["uncaught_RuntimeError"], 1)
+            self.assertEqual(status["exit_status_counts"]["uncaught_RuntimeError_fallback"], 1)
+
+    def test_export_logs_fills_empty_predictions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_path = root / "predictions.jsonl"
+            config = HarnessConfig(
+                mock_llm=True,
+                fallback_answer="fallback",
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = HarnessOrchestrator(config=config)
+            orch.export_logs(str(output_path), 0, "Q", "", "", "")
+            row = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(row["pred"], "fallback")
 
     def test_memory_prunes_to_max_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
