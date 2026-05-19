@@ -255,17 +255,16 @@ class InterfaceContractTests(unittest.TestCase):
             rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
             status = json.loads((root / "predictions.jsonl.status.json").read_text(encoding="utf-8"))
             self.assertEqual(len(results), 2)
-            self.assertEqual(rows[0]["pred"], "unknown")
+            self.assertEqual(rows[0]["pred"], "")
             self.assertEqual(rows[1]["pred"], "b")
-            self.assertEqual(status["exit_status_counts"]["uncaught_RuntimeError_fallback"], 1)
+            self.assertEqual(status["exit_status_counts"]["uncaught_RuntimeError"], 1)
 
-    def test_export_logs_fills_empty_predictions(self) -> None:
+    def test_export_logs_preserves_empty_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             output_path = root / "predictions.jsonl"
             config = HarnessConfig(
                 mock_llm=True,
-                fallback_answer="fallback",
                 result_dir=str(root / "outputs"),
                 trajectory_dir=str(root / "trajectories"),
                 memory_db_path=str(root / "memory.json"),
@@ -273,7 +272,58 @@ class InterfaceContractTests(unittest.TestCase):
             orch = HarnessOrchestrator(config=config)
             orch.export_logs(str(output_path), 0, "Q", "", "", "")
             row = json.loads(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(row["pred"], "fallback")
+            self.assertEqual(row["pred"], "")
+
+    def test_failed_case_gets_five_model_attempts_then_empty_pred(self) -> None:
+        class _Message:
+            content = ""
+            tool_calls = None
+            reasoning_content = ""
+
+        class _Choice:
+            message = _Message()
+
+        class _Response:
+            choices = [_Choice()]
+            usage = None
+
+        class _Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **_kwargs):
+                self.calls += 1
+                return _Response()
+
+        class _Chat:
+            def __init__(self) -> None:
+                self.completions = _Completions()
+
+        class _Client:
+            def __init__(self) -> None:
+                self.chat = _Chat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = HarnessConfig(
+                mock_llm=True,
+                max_steps=1,
+                min_model_attempts=5,
+                case_reflection_attempts=0,
+                case_reflection_max_steps=1,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = HarnessOrchestrator(config=config)
+            orch.config.mock_llm = False
+            client = _Client()
+            orch.client = client
+            result = orch.run_case(TaskCase(index=0, instruction="No answer", task_id="empty"))
+            self.assertEqual(result["pred"], "")
+            self.assertEqual(result["api_calls"], 5)
+            self.assertEqual(client.chat.completions.calls, 5)
+            self.assertEqual(result["exit_status"], "self_reflection_limits_exceeded")
 
     def test_memory_prunes_to_max_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

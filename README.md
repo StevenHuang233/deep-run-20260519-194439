@@ -37,22 +37,21 @@ export REFLECTION_MODEL_NAME=qwen3-32b
 export REFLECTION_MODEL_MAX_B=32
 ```
 
-## 单 case 反思自救与非空答案
+## 单 case 反思自救
 
-默认每个样本会尽量给出非空 `pred`：
+答案必须来自主模型生成，不使用 `unknown` 等非模型兜底答案。默认每个样本至少给主模型 5 次生成机会：
 
 1. 常规 ReAct 首轮执行。
 2. 如果首轮被门禁阻断、达到步数上限、模型没有产出可解析答案，Harness 会对同一个 case 的失败轨迹做反思，生成临时 CLIN 规则。
-3. 临时规则会作为 skeptical hint 追加到同一个轨迹中，再给主模型一个短预算恢复尝试。
-4. 如果恢复尝试仍失败，才使用 `FALLBACK_ANSWER` 作为最后保险，默认是 `unknown`。
+3. 临时规则会作为 skeptical hint 追加到同一个轨迹中，再给主模型短预算恢复尝试。
+4. 如果 5 次模型尝试后仍没有可解析答案，提交 JSONL 中的 `pred` 保持空字符串。
 
 可调参数：
 
 ```bash
-export CASE_REFLECTION_ATTEMPTS=1
+export MIN_MODEL_ATTEMPTS=5
+export CASE_REFLECTION_ATTEMPTS=4
 export CASE_REFLECTION_MAX_STEPS=6
-export ALWAYS_ANSWER=1
-export FALLBACK_ANSWER=unknown
 ```
 
 ## benchmark.csv 批量运行
@@ -107,8 +106,8 @@ export LLM_RETRY_MIN_SECONDS=1
 export LLM_RETRY_MAX_SECONDS=8
 export MEMORY_MAX_RULES=64
 export BATCH_CONTINUE_ON_ERROR=1
-export CASE_REFLECTION_ATTEMPTS=1
-export ALWAYS_ANSWER=1
+export MIN_MODEL_ATTEMPTS=5
+export CASE_REFLECTION_ATTEMPTS=4
 ```
 
 接口契约测试：

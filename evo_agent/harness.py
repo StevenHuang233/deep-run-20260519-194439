@@ -408,7 +408,7 @@ class HarnessOrchestrator:
                 break
         else:
             failure_reason = f"max_steps_reached:{max_steps}"
-            final_answer = "[HARNESS] Max steps reached. Last assistant message above."
+            final_answer = ""
             exit_status = "limits_exceeded"
 
         if failure_reason and exit_status == "unknown":
@@ -423,7 +423,7 @@ class HarnessOrchestrator:
         if self.config.reflection_enabled and self._should_reflection_retry(
             final_answer, failure_reason, exit_status, case.answer
         ):
-            for retry_no in range(1, max(0, self.config.case_reflection_attempts) + 1):
+            for retry_no in range(1, self._case_reflection_retry_budget() + 1):
                 reflection = self.compiler.compile_failed_trace(
                     traj.read_all(), case.instruction
                 )
@@ -466,20 +466,7 @@ class HarnessOrchestrator:
                 if self._has_parseable_prediction(final_answer):
                     break
 
-        final_answer, fallback_used = self._ensure_answer_text(
-            final_answer, "case ended without a parseable prediction"
-        )
-        if fallback_used:
-            failure_reason = self._append_reason(failure_reason, "fallback_answer_used")
-            if exit_status in {"empty", "failed", "limits_exceeded", "gate_blocked", "unknown"}:
-                exit_status = f"{exit_status}_fallback" if exit_status != "unknown" else "fallback_answer"
-            traj.write_event(
-                "fallback_answer",
-                {"pred": self.extract_pred(final_answer), "reason": failure_reason},
-                step_id=steps_done,
-            )
-
-        success = self._judge_success(final_answer, case.answer) and not fallback_used
+        success = self._judge_success(final_answer, case.answer)
         if case.answer and applied_rules:
             self.memory.apply_expel_reward(applied_rules, success)
 
@@ -519,7 +506,7 @@ class HarnessOrchestrator:
         return {
             "task_id": task_id,
             "answer": final_answer,
-            "pred": self.extract_pred(final_answer),
+            "pred": self._extract_model_pred(final_answer),
             "steps": steps_done,
             "trajectory_path": str(traj.path),
             "summary": traj.summary(),
@@ -536,7 +523,7 @@ class HarnessOrchestrator:
     def _should_reflection_retry(
         self, final_answer: str, failure_reason: str, exit_status: str, gold_answer: str = ""
     ) -> bool:
-        if self.config.case_reflection_attempts <= 0:
+        if self._case_reflection_retry_budget() <= 0:
             return False
         if gold_answer and self._has_parseable_prediction(final_answer):
             return not self._judge_success(final_answer, gold_answer)
@@ -545,6 +532,11 @@ class HarnessOrchestrator:
         if exit_status in {"submitted", "self_reflection_submitted"} and self._has_parseable_prediction(final_answer):
             return False
         return True
+
+    def _case_reflection_retry_budget(self) -> int:
+        min_retries = max(0, int(self.config.min_model_attempts) - 1)
+        configured = max(0, int(self.config.case_reflection_attempts))
+        return max(min_retries, configured)
 
     def _run_reflection_retry(
         self,
@@ -695,7 +687,7 @@ class HarnessOrchestrator:
             {
                 "retry_attempt": retry_no,
                 "exit_status": exit_status,
-                "pred": self.extract_pred(final_answer),
+                "pred": self._extract_model_pred(final_answer),
                 "failure_reason": failure_reason,
                 "api_calls": api_calls,
                 "total_tokens": total_tokens_accum,
@@ -764,19 +756,16 @@ class HarnessOrchestrator:
     def extract_pred(self, answer: str) -> str:
         return _normalize_answer(answer) or answer.strip()
 
+    def _extract_model_pred(self, answer: str) -> str:
+        return self.extract_pred(answer) if self._has_parseable_prediction(answer) else ""
+
     def _has_parseable_prediction(self, answer: str) -> bool:
         stripped = (answer or "").strip()
         return bool(self.extract_pred(answer)) and not stripped.upper().startswith("[HARNESS]")
 
-    def _ensure_answer_text(self, answer: str, reason: str = "") -> tuple[str, bool]:
-        if not self.config.always_answer:
-            return answer, False
-        if self._has_parseable_prediction(answer):
-            return answer, False
-        fallback = (self.config.fallback_answer or "unknown").strip() or "unknown"
-        return f"<answer>{fallback}</answer>", True
-
     def _append_reason(self, current: str, extra: str) -> str:
+        if not extra:
+            return current
         if current:
             return f"{current}; {extra}"
         return extra
@@ -811,8 +800,6 @@ class HarnessOrchestrator:
         answer: str,
         image: str = "",
     ) -> None:
-        if self.config.always_answer and not str(pred or "").strip():
-            pred = (self.config.fallback_answer or "unknown").strip() or "unknown"
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "a", encoding="utf-8") as f:
             f.write(
@@ -859,27 +846,16 @@ class HarnessOrchestrator:
                 if not continue_on_error:
                     raise
                 logger.error("case %s failed with uncaught exception: %s", case.task_id, exc, exc_info=True)
-                fallback_answer, _ = self._ensure_answer_text(
-                    "", f"uncaught_{type(exc).__name__}"
-                )
-                fallback_pred = self.extract_pred(fallback_answer)
                 result = {
                     "task_id": case.task_id or f"case_{case.index}",
-                    "answer": fallback_answer,
-                    "pred": fallback_pred,
+                    "answer": "",
+                    "pred": "",
                     "steps": 0,
                     "trajectory_path": "",
                     "summary": {},
                     "success": False,
-                    "failure_reason": self._append_reason(
-                        f"{type(exc).__name__}: {exc}",
-                        "fallback_answer_used" if fallback_pred else "",
-                    ).strip("; "),
-                    "exit_status": (
-                        f"uncaught_{type(exc).__name__}_fallback"
-                        if fallback_pred
-                        else f"uncaught_{type(exc).__name__}"
-                    ),
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                    "exit_status": f"uncaught_{type(exc).__name__}",
                     "api_calls": 0,
                     "total_tokens": 0,
                     "reflection": None,

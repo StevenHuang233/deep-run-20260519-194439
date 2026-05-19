@@ -45,11 +45,10 @@ class HarnessConfig:
     llm_retry_max_seconds: float = field(default_factory=lambda: _env_float("LLM_RETRY_MAX_SECONDS", "8"))
     context_recent_steps: int = field(default_factory=lambda: _env_int("CONTEXT_RECENT_STEPS", "8"))
     batch_continue_on_error: bool = field(default_factory=lambda: _env_bool("BATCH_CONTINUE_ON_ERROR", "1"))
-    always_answer: bool = field(default_factory=lambda: _env_bool("ALWAYS_ANSWER", "1"))
-    fallback_answer: str = field(default_factory=lambda: os.getenv("FALLBACK_ANSWER", "unknown"))
+    min_model_attempts: int = field(default_factory=lambda: _env_int("MIN_MODEL_ATTEMPTS", "5"))
     case_reflection_attempts: int = field(
         default_factory=lambda: _env_int(
-            "CASE_REFLECTION_ATTEMPTS", os.getenv("SELF_REFLECTION_ATTEMPTS", "1")
+            "CASE_REFLECTION_ATTEMPTS", os.getenv("SELF_REFLECTION_ATTEMPTS", "4")
         )
     )
     case_reflection_max_steps: int = field(

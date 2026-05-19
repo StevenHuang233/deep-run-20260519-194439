@@ -37,7 +37,7 @@ flowchart TD
 - 驱动最多 `MAX_STEPS` 轮 OpenAI-compatible tool calling。
 - 记录 system/user/assistant/tool/event 轨迹。
 - 在失败、门禁阻断或答案不匹配时触发反思和记忆写入。
-- 为刷榜稳定性默认启用单 case 反思恢复：首轮没有可解析 `pred` 时，先把失败轨迹编译成临时 CLIN 规则并追加短预算 ReAct 重试；若仍失败，再写入 `FALLBACK_ANSWER`，保证提交 JSONL 的 `pred` 非空。
+- 为刷榜稳定性默认启用单 case 反思恢复：首轮没有可解析 `pred` 时，先把失败轨迹编译成临时 CLIN 规则并追加短预算 ReAct 重试；默认至少给模型 5 次生成机会，仍失败则提交空 `pred`，不写入非模型兜底答案。
 
 ### ToolEnvironment
 
@@ -103,7 +103,7 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 
 ## 第四轮参考仓库吸收
 
-- mini-swe-agent 的批量 runner 会捕获单个样本异常、记录 exit status，并继续后续样本。本实现默认 `BATCH_CONTINUE_ON_ERROR=1`，遇到未捕获异常时写出非空 fallback `pred` 和 `uncaught_*_fallback` 状态；使用 `--strict` 可恢复遇错即停。
+- mini-swe-agent 的批量 runner 会捕获单个样本异常、记录 exit status，并继续后续样本。本实现默认 `BATCH_CONTINUE_ON_ERROR=1`，遇到未捕获异常时写出空 `pred` 和 `uncaught_*` 状态；使用 `--strict` 可恢复遇错即停。
 - mini-swe-agent 会保存批量状态报告。本实现为提交 JSONL 旁路生成 `*.status.json`，统计本次运行的 exit status、API calls 和 token 消耗。
 - ExpeL 在规则列表变满后会优先 REMOVE、按计数排序并裁剪。本实现新增 `MEMORY_MAX_RULES`，按权重、merge/edit 次数、更新时间保留最强规则，默认最多 64 条。
 
@@ -112,7 +112,7 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - CLIN 的 ScienceWorld agent 会在单 episode 内对无法映射的动作进行小预算重试，并在 episode 结束后总结经验供下一轮使用。本实现把这个思路迁移到问答：同一个 case 首轮失败后，立即编译临时规则并追加恢复尝试，不等到下一个样本才使用。
 - mini-swe-agent 的核心循环保持 `step -> save -> exit_status/submission` 的简洁结构。本实现沿用这种可追踪状态，把 `self_reflection_retry_start`、`self_reflection_retry_status` 和最终 `run_status` 都写进轨迹。
 - ExpeL 的经验提取和评测是分阶段的。本实现为了排行榜吞吐量，把“提取规则”和“本 case 使用规则”放进同一次 run，同时仍会把可泛化规则写入 `memory.json`。
-- `ALWAYS_ANSWER=1` 是最后一道保险。优先级为：正常答案 > 反思恢复答案 > `FALLBACK_ANSWER`。
+- 答案必须由主模型生成。优先级为：正常答案 > 反思恢复答案 > 空 `pred`；不会用 `unknown` 这类非模型文本兜底。
 
 ## 接口兼容性
 
@@ -141,10 +141,9 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - `LLM_RETRY_MAX_SECONDS`
 - `BATCH_CONTINUE_ON_ERROR`
 - `MEMORY_MAX_RULES`
+- `MIN_MODEL_ATTEMPTS`
 - `CASE_REFLECTION_ATTEMPTS`
 - `CASE_REFLECTION_MAX_STEPS`
-- `ALWAYS_ANSWER`
-- `FALLBACK_ANSWER`
 
 搜索/浏览器接口：
 

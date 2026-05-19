@@ -49,9 +49,18 @@ Commit: `9091f6e`
 
 ## Iteration 5: Single-Case Reflection Retry And Non-Empty Pred
 
-Commit: this commit
+Commit: `16a17c7`
 
 - 参考 CLIN 的 episode 内小预算恢复，把失败轨迹即时编译成临时 CLIN 规则，并在同一个 case 内追加短 ReAct 重试。
 - 参考 mini-swe-agent 的可追踪 exit/submission 模式，在轨迹中记录 `self_reflection_retry_start`、`self_reflection_retry_status` 和最终 `run_status`。
 - 保留 ExpeL 风格长期记忆写入；同 case 恢复使用的规则也会参与后续奖惩。
 - 默认 `ALWAYS_ANSWER=1`，正常答案和反思恢复都失败时才写入 `FALLBACK_ANSWER`，保证提交 JSONL 的 `pred` 非空。
+
+## Iteration 6: Model-Only Five Attempts
+
+Commit: this commit
+
+- 按刷榜约束撤销非模型 fallback 答案，`pred` 只能来自主模型生成内容。
+- 默认 `MIN_MODEL_ATTEMPTS=5`，首轮 ReAct 失败后至少追加 4 次单 case 反思恢复尝试。
+- 5 次模型尝试后仍没有可解析答案时，提交 JSONL 保持空 `pred`。
+- 批量未捕获异常恢复为 `uncaught_*` 状态和空 `pred`，避免混入非模型答案。
