@@ -104,6 +104,33 @@ export DREAM_MIN_FAILURES=1
 export DREAM_REPORT_PATH=outputs/dream_report.json
 ```
 
+## Memory Schema 与 Hybrid 检索
+
+长期记忆采用统一 schema，分为 `skill`、`bad_pattern`、`reflection` 三类。Memory 只保存可复用经验，不保存完整轨迹和具体答案。每条记忆包含触发条件、适用任务、执行步骤、避免事项、来源和统计置信度。
+
+默认检索使用轻量 hybrid 策略：
+
+- dense route：默认本地 hash embedding，便于无依赖运行。
+- lexical route：`trigger_keywords` 与任务文本做词汇碰撞。
+- rerank：综合向量相似度、任务类型、关键词命中、confidence、历史成功率。
+
+如果部署了 embedding 服务，可直接打开接口：
+
+```bash
+export MEMORY_EMBEDDING_ENABLED=1
+export EMBEDDING_BASE_URL=http://127.0.0.1:8000/v1
+export EMBEDDING_MODEL=all-MiniLM-L6-v2
+export EMBEDDING_API_KEY=EMPTY
+```
+
+使用后的记忆会写入 `usage_logs.jsonl`，任务结束后用：
+
+```text
+confidence = (success_count + 1) / (success_count + failure_count + 2)
+```
+
+更新可信度。`usage_count >= 3` 且 `confidence < 0.3` 的记忆会被标记为 `deprecated`，后续不会检索。
+
 `benchmark.csv` 中的 base64 图片会落到 `outputs/benchmark_images/`，用于模型视觉输入和 `search_image` 本地文件上传；输出 JSONL 仍保留原始 `image` 字段。
 
 输出 JSONL 遵循提交格式：

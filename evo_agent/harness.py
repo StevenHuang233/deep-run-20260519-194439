@@ -292,13 +292,45 @@ class HarnessOrchestrator:
             critical_limit=self.config.gate_critical_limit,
         )
 
-        memory_rules = self.memory.retrieve_top_rules(case.instruction)
+        task_kind = self.planner.task_kind(
+            case.instruction, bool(case.image or case.image_url or case.image_b64)
+        )
+        retrieved_memories = self.memory.retrieve_memories(
+            case.instruction, task_type=task_kind, top_k=3
+        )
+        memory_rules = self.memory.format_memories_for_prompt(retrieved_memories)
+        applied_memory_ids = [
+            str(mem.get("memory_id") or mem.get("id"))
+            for mem in retrieved_memories
+            if mem.get("memory_id") or mem.get("id")
+        ]
+        if applied_memory_ids:
+            self.memory.log_usage(
+                applied_memory_ids,
+                episode_id=task_id,
+                task_type=task_kind,
+                question=case.instruction,
+                used_position="planner",
+            )
         system_prompt = self.inject_historical_guidelines(SYSTEM_PROMPT, memory_rules)
         traj.write(Role.SYSTEM, system_prompt, step_id=0)
         traj.write(Role.USER, self._build_user_content(case), step_id=0)
         traj.write_event(
             "memory_retrieval",
-            {"rules": memory_rules, "task_kind": self.planner.task_kind(case.instruction, bool(case.image or case.image_url or case.image_b64))},
+            {
+                "rules": memory_rules,
+                "memory_ids": applied_memory_ids,
+                "task_kind": task_kind,
+                "retrieved": [
+                    {
+                        "memory_id": mem.get("memory_id"),
+                        "memory_type": mem.get("memory_type"),
+                        "score": mem.get("_score"),
+                        "title": mem.get("title"),
+                    }
+                    for mem in retrieved_memories
+                ],
+            },
             step_id=0,
         )
 
@@ -440,9 +472,13 @@ class HarnessOrchestrator:
                         if self.config.memory_model_enabled
                         else None,
                         task_instruction=case.instruction,
+                        task_type=task_kind,
+                        episode_id=task_id,
                     )
                     retry_rule = str(memory_write.get("rule") or retry_rule)
                     traj.write_event("memory_write", memory_write, step_id=steps_done)
+                    if memory_write.get("memory_id"):
+                        applied_memory_ids.append(str(memory_write["memory_id"]))
                 if retry_rule:
                     applied_rules.append(retry_rule)
 
@@ -467,8 +503,14 @@ class HarnessOrchestrator:
                     break
 
         success = self._judge_success(final_answer, case.answer)
-        if case.answer and applied_rules:
-            self.memory.apply_expel_reward(applied_rules, success)
+        if applied_memory_ids:
+            self.memory.update_after_episode(
+                applied_memory_ids,
+                episode_id=task_id,
+                outcome="success" if success else "failure",
+                judged_helpful=success,
+                comment="Automatically updated from harness episode outcome.",
+            )
 
         if (
             reflection_dict is None
@@ -488,6 +530,8 @@ class HarnessOrchestrator:
                     if self.config.memory_model_enabled
                     else None,
                     task_instruction=case.instruction,
+                    task_type=task_kind,
+                    episode_id=task_id,
                 )
                 traj.write_event("memory_write", memory_write, step_id=steps_done)
 
@@ -518,6 +562,7 @@ class HarnessOrchestrator:
             "reflection": reflection_dict,
             "memory_write": memory_write,
             "applied_rules": applied_rules,
+            "applied_memory_ids": applied_memory_ids,
         }
 
     def _should_reflection_retry(

@@ -342,6 +342,47 @@ class InterfaceContractTests(unittest.TestCase):
             self.assertEqual(len(memory.memory_db), 2)
             self.assertLessEqual(len(json.loads((Path(tmp) / "memory.json").read_text(encoding="utf-8"))), 2)
 
+    def test_typed_memory_hybrid_retrieval_and_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory = SkepticalMemoryManager(str(root / "memory.json"), max_rules=10)
+            memory.memory_db = [
+                memory._normalize_entry(
+                    {
+                        "memory_id": "bad_2wiki_000001",
+                        "memory_type": "bad_pattern",
+                        "task_type": "2wiki",
+                        "title": "Do not stop at the first-hop entity",
+                        "trigger_pattern": "The question asks for an attribute of an intermediate entity.",
+                        "trigger_keywords": ["director", "birthplace", "founder", "nationality"],
+                        "content": "Continue from the intermediate entity to the final requested attribute.",
+                        "procedure": ["Find the intermediate entity.", "Search the final requested attribute."],
+                        "avoid": ["Do not answer the intermediate entity."],
+                        "source": {"source_type": "test", "source_episode_ids": []},
+                        "stats": {
+                            "usage_count": 0,
+                            "success_count": 0,
+                            "failure_count": 0,
+                            "confidence": 0.5,
+                        },
+                        "status": "active",
+                        "embedding_text": "Task type: 2wiki. Trigger: director birthplace. Avoid answering intermediate entity.",
+                    }
+                )
+            ]
+            memory._save_db()
+            retrieved = memory.retrieve_memories(
+                "What is the birthplace of the director of X?", task_type="2wiki", top_k=3
+            )
+            self.assertEqual(retrieved[0]["memory_id"], "bad_2wiki_000001")
+            memory.log_usage(["bad_2wiki_000001"], "episode_1", "2wiki", "Q", "planner")
+            memory.update_after_episode(["bad_2wiki_000001"], "episode_1", "success")
+            updated = memory.memory_db[0]
+            self.assertEqual(updated["stats"]["usage_count"], 1)
+            self.assertEqual(updated["stats"]["success_count"], 1)
+            self.assertGreater(updated["stats"]["confidence"], 0.5)
+            self.assertTrue((root / "usage_logs.jsonl").exists())
+
     def test_dreamer_consolidates_failed_trajectory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

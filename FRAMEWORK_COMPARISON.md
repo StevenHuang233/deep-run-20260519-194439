@@ -47,7 +47,8 @@
 | V4 | `9091f6e` | Batch Fault Tolerance | 单样本异常继续跑；`*.status.json`；Memory 上限裁剪 | 保留 |
 | V5 | `16a17c7` | Single-Case Reflection Retry | 同 case 失败后临时 CLIN 规则恢复；曾加入非模型 fallback | 反思恢复保留，非模型 fallback 废弃 |
 | V6 | `6d6b7ee` | Model-Only Five Attempts | 答案只能来自模型；默认至少 5 次模型尝试；仍失败则空 `pred` | 当前推荐版 |
-| V7 | 当前提交 | Dream Memory Consolidation | 离线读取失败轨迹，整理成 CLIN 规则，合并/裁剪 `memory.json` | 推荐批跑后使用 |
+| V7 | `2d3e5af` | Dream Memory Consolidation | 离线读取失败轨迹，整理成 CLIN 规则，合并/裁剪 `memory.json` | 推荐批跑后使用 |
+| V8 | 当前提交 | Typed Hybrid Memory | 统一 schema、三类 memory、hybrid retrieval、usage logs、confidence 更新 | 当前推荐版 |
 
 ## 参考仓库框架对比
 
@@ -55,7 +56,7 @@
 | --- | --- | --- | --- | --- |
 | mini-swe-agent / SWE-agent | 极简 Agent 循环：query -> execute actions -> save trajectory -> exit status | 简洁控制循环、模型调用统计、轨迹保存、批量状态 | `run_status` event、API calls 统计、`--resume`、批量异常续跑 | 不采用其代码编辑环境和 SWE-bench 专用 patch 输出 |
 | CLIN | 交互后总结因果 memory，用 memory 快速适应新任务/新环境 | CLIN 单行因果规则、episode 内失败恢复、最近轨迹摘要 | `CognitiveCompiler` 生成 `Context -> Action is Necessary` 规则；同 case 临时规则恢复 | 不使用 ScienceWorld 环境，不做句向量动作映射 |
-| ExpeL | 收集经验 -> 抽取 insight -> 评测时召回；规则支持 ADD/EDIT/UPVOTE/DOWNVOTE/REMOVE | 自然语言经验库、规则合并、奖惩、淘汰 | `SkepticalMemoryManager` 的 `ADD/EDIT/IGNORE`、`UPVOTE/DOWNVOTE`、`MEMORY_MAX_RULES` | 不做完整离线 experience gathering / insight extraction 两阶段流水线 |
+| ExpeL | 收集经验 -> 抽取 insight -> 评测时召回；规则支持 ADD/EDIT/UPVOTE/DOWNVOTE/REMOVE | 自然语言经验库、规则合并、奖惩、淘汰 | `SkepticalMemoryManager` 的 `ADD/EDIT/IGNORE`、usage logs、confidence 更新、`MEMORY_MAX_RULES` | 暂不做完整人工审计式 experience gathering |
 | AutoDream / OpenClaw memory consolidation | 后台整理多轮 session memory | 定期整理、合并重复、删除陈旧规则、写整理报告 | `MemoryDreamer` 读取失败轨迹，生成规则并更新 `memory.json` / `dream_report.json` | 不做常驻后台任务，避免影响评测运行 |
 | OpenClaw / Tool Gate 类设计 | 工具调用层做死循环和错误拦截 | 物理门禁独立于 LLM，减少重复调用和 token 浪费 | `ToolGateMiddleware` 用 Jaccard 检测近似重复，追踪连续错误 | 没有复刻其全部工程实现，只吸收门禁思想 |
 | LLaMA-Factory | 统一 SFT / LoRA / 数据格式流水线 | 后续蒸馏训练可用 | 当前只保留轨迹数据可导出能力 | 暂不实现蒸馏 |
@@ -66,6 +67,7 @@
 - 不修改旧代码，降低破坏现有搜索/浏览器启动方式的风险。
 - 接口兼容：单题、批量、模型 API、搜索、浏览器环境变量都尽量沿用旧设计。
 - 同时具备跨任务进化、同 case 自救和离线 Dream Memory：Memory 用于后续任务，临时 CLIN 规则用于当前 case 恢复，Dreamer 用于批跑后清洗失败模式。
+- Memory schema 不绑定具体 benchmark 格式，`task_type` 只是检索 rerank 因子，未知任务仍可按 general/simpleqa/visual_qa/2wiki 等宽泛模式召回。
 - 符合当前约束：答案必须由模型生成；至少 5 次尝试；失败后空 `pred`。
 
 ## 当前框架的不足

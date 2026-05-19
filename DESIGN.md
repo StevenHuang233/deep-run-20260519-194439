@@ -72,16 +72,18 @@ flowchart TD
 
 位置：`evo_agent/memory.py`
 
-- 快速关键词硬匹配召回 Top-2 规则，避免 prompt 膨胀。
+- 长期记忆统一为 `skill`、`bad_pattern`、`reflection` 三类，均使用同一 schema：触发条件、任务类型、执行步骤、避免事项、来源和统计信息。
+- Memory 不存完整轨迹，不存具体答案，只存可泛化经验。
+- 检索采用 hybrid 策略：dense route 走可插拔 embedding 接口，默认本地 hash embedding；lexical route 走 `trigger_keywords` 碰撞；最终按向量相似度、任务类型、关键词、confidence、历史成功率 rerank。
 - 记忆仅作为线索注入，不作为事实。
 - 参考 ExpeL 的规则编辑思想，用 `ADD/EDIT/IGNORE` 管理新规则。
-- 使用 `UPVOTE/DOWNVOTE` 更新权重：
+- 使用 usage log 和成功/失败反馈更新置信度：
 
 ```text
-W_c = (Up - Down) / (Up + Down + 0.1)
+confidence = (success_count + 1) / (success_count + failure_count + 2)
 ```
 
-- 权重低于 `0.20` 的规则主动淘汰。
+- `usage_count >= 3` 且 `confidence < 0.30` 的记忆会标记为 `deprecated`，后续不再检索。
 
 ### MemoryDreamer
 
@@ -139,6 +141,13 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - 整理过程分为 Orient（读取 memory 和轨迹）、Gather（筛失败轨迹）、Consolidate（编译 CLIN 规则并 ADD/EDIT/IGNORE）、Prune（按权重裁剪和写 report）。
 - 它只更新 `memory.json` 和 `dream_report.json`，不参与 `pred` 生成，因此不破坏“答案必须由模型生成”的约束。
 
+## 第八轮 Typed Hybrid Memory
+
+- 吸收正式 Memory 设计中的统一 schema，把旧的单行 `rule` 升级为 `skill`、`bad_pattern`、`reflection` 三类长期记忆。
+- 新增 `usage_logs.jsonl`，每次检索注入都会记录 memory usage，任务结束后更新 usage/success/failure/confidence。
+- 新增 embedding 接口预留：部署 embedding 服务后设置 `MEMORY_EMBEDDING_ENABLED=1`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL` 即可启用 dense route。
+- 为保持通用性，task_type 只作为 rerank 因子，不写死 `benchmark.csv` 题型；未知任务会落到 `general` / `simpleqa` / `visual_qa` / `2wiki` 等宽泛类别。
+
 ## 接口兼容性
 
 单题接口：
@@ -172,6 +181,11 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - `DREAM_MAX_TRAJECTORIES`
 - `DREAM_MIN_FAILURES`
 - `DREAM_REPORT_PATH`
+- `MEMORY_EMBEDDING_ENABLED`
+- `EMBEDDING_BASE_URL`
+- `EMBEDDING_MODEL`
+- `EMBEDDING_API_KEY`
+- `MEMORY_RETRIEVE_THRESHOLD`
 
 搜索/浏览器接口：
 

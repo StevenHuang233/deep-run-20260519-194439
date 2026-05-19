@@ -78,6 +78,8 @@ class MemoryDreamer:
                     if self.config.memory_model_enabled
                     else None,
                     task_instruction=item["instruction"],
+                    task_type=item.get("task_type", "general"),
+                    episode_id=item.get("task_id"),
                 )
                 update["trajectory_path"] = item["path"]
                 update["failure_type"] = reflection.failure_type
@@ -126,6 +128,7 @@ class MemoryDreamer:
                     "instruction": self._extract_instruction(rows),
                     "exit_status": status.get("exit_status", ""),
                     "failure_reason": status.get("failure_reason", ""),
+                    "task_type": self._infer_task_type(rows, status),
                     "failed": self._is_failed(rows, status),
                 }
             )
@@ -178,6 +181,20 @@ class MemoryDreamer:
                 ]
                 return "\n".join(texts)[:4000]
         return ""
+
+    def _infer_task_type(self, rows: list[dict[str, Any]], status: dict[str, Any]) -> str:
+        for row in rows:
+            if row.get("event_type") != "memory_retrieval":
+                continue
+            content = row.get("content")
+            if isinstance(content, dict) and content.get("task_kind"):
+                return str(content["task_kind"])
+        instruction = self._extract_instruction(rows).lower()
+        if "image_url" in instruction or "local_image_path_for_tools" in instruction:
+            return "visual_qa"
+        if any(marker in instruction for marker in ("director", "founder", "author", "birthplace", "nationality")):
+            return "2wiki"
+        return "general"
 
     def _memory_keywords(self, item: dict[str, Any], reflection: Reflection) -> list[str]:
         text = " ".join(

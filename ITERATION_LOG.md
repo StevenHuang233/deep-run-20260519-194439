@@ -67,9 +67,19 @@ Commit: `6d6b7ee`
 
 ## Iteration 7: Dream Memory Consolidation
 
-Commit: this commit
+Commit: `2d3e5af`
 
 - 新增 `MemoryDreamer`，离线读取失败轨迹并整理成可泛化 CLIN 规则。
 - 新增 CLI：`--dream-memory` 手动整理，`--dream-after-run` 在批量运行后整理。
 - 新增 `dream_report.json`，记录 reviewed trajectories、failures、memory updates 和 prune 结果。
 - Dream Memory 只更新 `memory.json`，不会生成或填充 `pred`。
+
+## Iteration 8: Typed Hybrid Memory
+
+Commit: this commit
+
+- 将 Memory 从单行 rule 升级为统一 schema，支持 `skill`、`bad_pattern`、`reflection` 三类长期记忆。
+- 新增 hybrid retrieval：dense route、lexical route、RRF 和任务类型/关键词/confidence/成功率 rerank。
+- 新增可插拔 embedding 接口；无 embedding 服务时使用本地 hash embedding 保持可运行。
+- 新增 `usage_logs.jsonl` 和 episode 后 confidence 更新，低置信记忆会标记为 `deprecated`。
+- Harness 现在记录被注入的 memory id，并在任务结束后更新使用效果。
