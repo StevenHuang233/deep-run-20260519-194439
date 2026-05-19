@@ -7,6 +7,7 @@ import csv
 import json
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -22,6 +23,14 @@ from .trajectory import Trajectory
 from .types import Reflection, Role, TaskCase
 
 logger = logging.getLogger("evo_harness.harness")
+
+
+class LLMCallFailure(RuntimeError):
+    """Wrap model-call errors with the number of attempted API calls."""
+
+    def __init__(self, message: str, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
 
 
 def _json_dumps(obj: Any) -> str:
@@ -105,6 +114,54 @@ class HarnessOrchestrator:
                 "Install requirements.txt or set MOCK_LLM=1 for local smoke tests."
             ) from exc
         return OpenAI(base_url=self.config.llm_base_url, api_key="EMPTY")
+
+    def _call_llm_with_retry(self, request_kwargs: dict[str, Any]) -> tuple[Any, int]:
+        max_attempts = max(1, self.config.llm_retry_attempts)
+        attempts = 0
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            attempts = attempt
+            try:
+                return self.client.chat.completions.create(**request_kwargs), attempts
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_attempts or self._is_non_retryable_llm_error(exc):
+                    break
+                sleep_for = min(
+                    self.config.llm_retry_max_seconds,
+                    self.config.llm_retry_min_seconds * (2 ** (attempt - 1)),
+                )
+                logger.warning(
+                    "LLM call failed on attempt %s/%s: %s. Retrying in %.1fs",
+                    attempt,
+                    max_attempts,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(max(sleep_for, 0))
+        message = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown error"
+        raise LLMCallFailure(message, attempts)
+
+    def _is_non_retryable_llm_error(self, exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = (
+            "authentication",
+            "permissiondenied",
+            "permission denied",
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "api key",
+            "401",
+            "403",
+            "context length",
+            "contextwindow",
+            "maximum context",
+            "unsupported",
+            "not found",
+            "404",
+        )
+        return any(marker in text for marker in markers)
 
     # ------------------------------------------------------------------
     # Loading
@@ -251,7 +308,7 @@ class HarnessOrchestrator:
 
         for step in range(1, max_steps + 1):
             steps_done = step
-            messages = traj.to_messages()
+            messages = traj.to_messages(recent_steps=self.config.context_recent_steps)
             if self.config.mock_llm:
                 final_answer = self._mock_answer(case)
                 exit_status = "submitted"
@@ -277,8 +334,13 @@ class HarnessOrchestrator:
             try:
                 if self.client is None:
                     raise RuntimeError("OpenAI client is unavailable")
-                response = self.client.chat.completions.create(**request_kwargs)
-                api_calls += 1
+                response, attempts = self._call_llm_with_retry(request_kwargs)
+                api_calls += attempts
+            except LLMCallFailure as exc:
+                api_calls += exc.attempts
+                failure_reason = f"llm_call_failed: {type(exc).__name__}: {exc}"
+                traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=step)
+                break
             except Exception as exc:
                 failure_reason = f"llm_call_failed: {type(exc).__name__}: {exc}"
                 traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=step)
@@ -508,13 +570,18 @@ class HarnessOrchestrator:
         limit: Optional[int] = None,
         start: int = 0,
         trajectory_dir: Optional[str] = None,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
         results = []
         output_path = output_path or str(Path(self.config.result_dir) / "predictions.jsonl")
-        if Path(output_path).exists():
+        completed_indices = self._read_completed_indices(output_path) if resume else set()
+        if Path(output_path).exists() and not resume:
             Path(output_path).unlink()
         for case in self.load_next_case():
             if case.index < start:
+                continue
+            if case.index in completed_indices:
+                logger.info("case %s skipped because output already exists", case.task_id)
                 continue
             if limit is not None and len(results) >= limit:
                 break
@@ -536,6 +603,22 @@ class HarnessOrchestrator:
                 result["pred"][:120],
             )
         return results
+
+    def _read_completed_indices(self, output_path: str) -> set[int]:
+        path = Path(output_path)
+        if not path.exists():
+            return set()
+        completed = set()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row.get("index"), int):
+                completed.add(row["index"])
+        return completed
 
 
 def run_task(

@@ -92,6 +92,12 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - 轨迹文件名会清洗 `task_id`，避免用户传入包含路径分隔符或特殊字符的任务 ID。
 - 新增 `tests/test_interface_contracts.py`，用标准库 `unittest` 检查工具名、环境变量读取、32B 上限、图片 data URI 和输出 schema。
 
+## 第三轮参考仓库吸收
+
+- mini-swe-agent 的模型层会对瞬时 API 失败做指数退避重试。本实现加入 `LLM_RETRY_ATTEMPTS`、`LLM_RETRY_MIN_SECONDS`、`LLM_RETRY_MAX_SECONDS`，但对鉴权、权限、404、上下文窗口等非重试错误立即失败。
+- mini-swe-agent 的 benchmark runner 会跳过已有预测，避免长批量运行中断后重跑。本实现新增 CLI `--resume`，读取输出 JSONL 中已有 `index` 并跳过。
+- CLIN 会在长轨迹中优先保留最近 action-observation 对。本实现新增 `CONTEXT_RECENT_STEPS`，默认只把 system/user 和最近 8 个执行 step 回放给主模型，完整轨迹仍然写入磁盘。
+
 ## 接口兼容性
 
 单题接口：
@@ -113,6 +119,10 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - `MAX_STEPS`
 - `MAX_TOKENS`
 - `DISABLE_TOOLS`
+- `CONTEXT_RECENT_STEPS`
+- `LLM_RETRY_ATTEMPTS`
+- `LLM_RETRY_MIN_SECONDS`
+- `LLM_RETRY_MAX_SECONDS`
 
 搜索/浏览器接口：
 
@@ -158,4 +168,5 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 python -m compileall -q .
 python -m unittest discover -s tests
 MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --output outputs/mock_predictions.jsonl
+MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --resume --output outputs/mock_predictions.jsonl
 ```

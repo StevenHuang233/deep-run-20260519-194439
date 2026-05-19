@@ -40,6 +40,10 @@ class HarnessConfig:
     temperature: float = field(default_factory=lambda: _env_float("TEMPERATURE", "1.0"))
     disable_tools: bool = field(default_factory=lambda: _env_bool("DISABLE_TOOLS", "0"))
     mock_llm: bool = field(default_factory=lambda: _env_bool("MOCK_LLM", "0"))
+    llm_retry_attempts: int = field(default_factory=lambda: _env_int("LLM_RETRY_ATTEMPTS", "3"))
+    llm_retry_min_seconds: float = field(default_factory=lambda: _env_float("LLM_RETRY_MIN_SECONDS", "1"))
+    llm_retry_max_seconds: float = field(default_factory=lambda: _env_float("LLM_RETRY_MAX_SECONDS", "8"))
+    context_recent_steps: int = field(default_factory=lambda: _env_int("CONTEXT_RECENT_STEPS", "8"))
 
     trajectory_dir: str = field(
         default_factory=lambda: os.getenv("TRAJECTORY_DIR", str(PACKAGE_ROOT / "trajectories"))

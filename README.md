@@ -50,6 +50,12 @@ python -m task_runner --task-file ../benchmark.csv --output outputs/benchmark_pr
 python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl
 ```
 
+断点续跑时不会删除已有输出，并会跳过已出现的 `index`：
+
+```bash
+python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl --resume
+```
+
 `benchmark.csv` 中的 base64 图片会落到 `outputs/benchmark_images/`，用于模型视觉输入和 `search_image` 本地文件上传；输出 JSONL 仍保留原始 `image` 字段。
 
 输出 JSONL 遵循提交格式：
@@ -66,6 +72,15 @@ MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 2 --output
 ```
 
 `MOCK_LLM=1` 只用于验证 CSV 解析、图片落盘、轨迹和输出格式；真实评测不要设置。
+
+上下文和模型重试可用环境变量控制：
+
+```bash
+export CONTEXT_RECENT_STEPS=8
+export LLM_RETRY_ATTEMPTS=3
+export LLM_RETRY_MIN_SECONDS=1
+export LLM_RETRY_MAX_SECONDS=8
+```
 
 接口契约测试：
 

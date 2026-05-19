@@ -62,10 +62,24 @@ class Trajectory:
                 rows.append(json.loads(line))
         return rows
 
-    def to_messages(self) -> list[dict]:
+    def to_messages(self, recent_steps: int | None = None) -> list[dict]:
+        keep_steps: set[int | None] | None = None
+        if recent_steps and recent_steps > 0:
+            step_ids = sorted(
+                {
+                    item.get("step_id")
+                    for item in self.read_all()
+                    if isinstance(item.get("step_id"), int) and item.get("step_id") > 0
+                }
+            )
+            keep_steps = set(step_ids[-recent_steps:])
+            keep_steps.update({0, None})
+
         messages = []
         for entry in self.read_all():
             if entry.get("include_in_context") is False:
+                continue
+            if keep_steps is not None and entry.get("step_id") not in keep_steps:
                 continue
             role = entry.get("role")
             if role not in {"system", "user", "assistant", "tool"}:

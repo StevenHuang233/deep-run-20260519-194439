@@ -36,6 +36,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=None, help="Prediction JSONL output path")
     p.add_argument("--limit", type=int, default=None, help="Optional batch limit")
     p.add_argument("--start", type=int, default=0, help="Start index for batch run")
+    p.add_argument("--resume", action="store_true", help="Append to output and skip existing indices")
     return p.parse_args()
 
 
@@ -68,6 +69,7 @@ def main() -> None:
             limit=args.limit,
             start=args.start,
             trajectory_dir=args.traj_dir,
+            resume=args.resume,
         )
         print(f"Batch complete: {len(results)} cases")
         print(f"Output: {args.output or Path(config.result_dir) / 'predictions.jsonl'}")
