@@ -27,8 +27,9 @@ MemoryAdvisor = Callable[[str, list[dict[str, Any]], str], dict[str, Any]]
 class SkepticalMemoryManager:
     """Natural-language memory with keyword retrieval and ExpeL-style editing."""
 
-    def __init__(self, db_path: str = "memory.json"):
+    def __init__(self, db_path: str = "memory.json", max_rules: int = 64):
         self.db_path = Path(db_path)
+        self.max_rules = max_rules
         self.memory_db: list[dict[str, Any]] = self._load_db()
 
     def _load_db(self) -> list[dict[str, Any]]:
@@ -137,10 +138,14 @@ class SkepticalMemoryManager:
         if operation == "EDIT":
             target = self._find_target(target_id, similar)
             if target is not None:
-                return self._edit_entry(target, advised_rule, base_keywords, advice)
+                result = self._edit_entry(target, advised_rule, base_keywords, advice)
+                self.prune_memory()
+                return result
             operation = "ADD"
 
-        return self._add_entry(advised_rule, base_keywords, advice)
+        result = self._add_entry(advised_rule, base_keywords, advice)
+        self.prune_memory()
+        return result
 
     def _heuristic_advice(
         self, new_rule: str, similar_entries: list[dict[str, Any]]
@@ -239,4 +244,33 @@ class SkepticalMemoryManager:
             entry["weight"] = self._weight(entry)
             entry["updated_at"] = time.time()
         self.memory_db = [e for e in self.memory_db if self._weight(e) >= 0.20]
+        self.prune_memory(save=False)
         self._save_db()
+
+    def prune_memory(self, save: bool = True) -> dict[str, Any]:
+        """Keep only the strongest rules, similar to ExpeL's bounded rule list."""
+        before = len(self.memory_db)
+        self.memory_db = [e for e in self.memory_db if self._weight(e) >= 0.20]
+        if self.max_rules > 0 and len(self.memory_db) > self.max_rules:
+            self.memory_db.sort(
+                key=lambda e: (
+                    self._weight(e),
+                    int(e.get("merge_count", 0)) + int(e.get("edit_count", 0)),
+                    float(e.get("updated_at", 0)),
+                ),
+                reverse=True,
+            )
+            for removed in self.memory_db[self.max_rules :]:
+                removed["last_operation"] = "REMOVE"
+                removed["last_reason"] = "memory_max_rules_prune"
+            self.memory_db = self.memory_db[: self.max_rules]
+        removed_count = before - len(self.memory_db)
+        if save and removed_count:
+            self._save_db()
+        return {
+            "operation": "PRUNE",
+            "before": before,
+            "after": len(self.memory_db),
+            "removed": removed_count,
+            "max_rules": self.max_rules,
+        }

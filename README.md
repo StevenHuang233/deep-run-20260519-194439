@@ -56,6 +56,13 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl --resume
 ```
 
+默认批量运行会在单个样本出现未捕获异常时继续处理后续样本，并生成
+`benchmark_predictions.jsonl.status.json` 状态摘要。需要遇错立即停止时使用：
+
+```bash
+python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl --strict
+```
+
 `benchmark.csv` 中的 base64 图片会落到 `outputs/benchmark_images/`，用于模型视觉输入和 `search_image` 本地文件上传；输出 JSONL 仍保留原始 `image` 字段。
 
 输出 JSONL 遵循提交格式：
@@ -80,6 +87,8 @@ export CONTEXT_RECENT_STEPS=8
 export LLM_RETRY_ATTEMPTS=3
 export LLM_RETRY_MIN_SECONDS=1
 export LLM_RETRY_MAX_SECONDS=8
+export MEMORY_MAX_RULES=64
+export BATCH_CONTINUE_ON_ERROR=1
 ```
 
 接口契约测试：

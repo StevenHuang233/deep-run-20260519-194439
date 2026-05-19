@@ -98,6 +98,12 @@ W_c = (Up - Down) / (Up + Down + 0.1)
 - mini-swe-agent 的 benchmark runner 会跳过已有预测，避免长批量运行中断后重跑。本实现新增 CLI `--resume`，读取输出 JSONL 中已有 `index` 并跳过。
 - CLIN 会在长轨迹中优先保留最近 action-observation 对。本实现新增 `CONTEXT_RECENT_STEPS`，默认只把 system/user 和最近 8 个执行 step 回放给主模型，完整轨迹仍然写入磁盘。
 
+## 第四轮参考仓库吸收
+
+- mini-swe-agent 的批量 runner 会捕获单个样本异常、记录 exit status，并继续后续样本。本实现默认 `BATCH_CONTINUE_ON_ERROR=1`，遇到未捕获异常时写出空 `pred` 和 `uncaught_*` 状态；使用 `--strict` 可恢复遇错即停。
+- mini-swe-agent 会保存批量状态报告。本实现为提交 JSONL 旁路生成 `*.status.json`，统计本次运行的 exit status、API calls 和 token 消耗。
+- ExpeL 在规则列表变满后会优先 REMOVE、按计数排序并裁剪。本实现新增 `MEMORY_MAX_RULES`，按权重、merge/edit 次数、更新时间保留最强规则，默认最多 64 条。
+
 ## 接口兼容性
 
 单题接口：
@@ -123,6 +129,8 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 - `LLM_RETRY_ATTEMPTS`
 - `LLM_RETRY_MIN_SECONDS`
 - `LLM_RETRY_MAX_SECONDS`
+- `BATCH_CONTINUE_ON_ERROR`
+- `MEMORY_MAX_RULES`
 
 搜索/浏览器接口：
 
@@ -169,4 +177,5 @@ python -m compileall -q .
 python -m unittest discover -s tests
 MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --output outputs/mock_predictions.jsonl
 MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --resume --output outputs/mock_predictions.jsonl
+MOCK_LLM=1 python -m task_runner --task-file ../benchmark.csv --limit 1 --strict --output outputs/mock_predictions.jsonl
 ```

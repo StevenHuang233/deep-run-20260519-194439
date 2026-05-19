@@ -11,6 +11,7 @@ from pathlib import Path
 from evo_agent.config import HarnessConfig
 from evo_agent.environment import ToolEnvironment
 from evo_agent.harness import HarnessOrchestrator, _detect_image_suffix
+from evo_agent.memory import SkepticalMemoryManager
 from evo_agent.model_policy import assert_model_within_limit
 from evo_agent.trajectory import Trajectory
 from evo_agent.types import Role
@@ -155,6 +156,67 @@ class InterfaceContractTests(unittest.TestCase):
             response, attempts = orch._call_llm_with_retry({})
             self.assertEqual(response, {"ok": True})
             self.assertEqual(attempts, 3)
+
+    def test_batch_continues_on_uncaught_case_error(self) -> None:
+        class _FailingOrchestrator(HarnessOrchestrator):
+            def run_case(self, case, max_steps=None, trajectory_dir=None):
+                if case.index == 0:
+                    raise RuntimeError("boom")
+                return {
+                    "task_id": case.task_id,
+                    "answer": "<answer>B</answer>",
+                    "pred": "b",
+                    "steps": 1,
+                    "trajectory_path": "",
+                    "summary": {},
+                    "success": True,
+                    "failure_reason": "",
+                    "exit_status": "submitted",
+                    "api_calls": 0,
+                    "total_tokens": 0,
+                    "reflection": None,
+                    "memory_write": None,
+                    "applied_rules": [],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "mini.csv"
+            csv_path.write_text(
+                "problem,image,answer\nFirst,,A\nSecond,,B\n",
+                encoding="utf-8",
+            )
+            output_path = root / "predictions.jsonl"
+            config = HarnessConfig(
+                mock_llm=True,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = _FailingOrchestrator(task_file=str(csv_path), config=config)
+            results = orch.run_file(output_path=str(output_path), continue_on_error=True)
+            rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            status = json.loads((root / "predictions.jsonl.status.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(results), 2)
+            self.assertEqual(rows[0]["pred"], "")
+            self.assertEqual(rows[1]["pred"], "b")
+            self.assertEqual(status["exit_status_counts"]["uncaught_RuntimeError"], 1)
+
+    def test_memory_prunes_to_max_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = SkepticalMemoryManager(str(Path(tmp) / "memory.json"), max_rules=2)
+            for idx in range(4):
+                memory.auto_dream_deduplication(
+                    f"[Context {idx}] -> Action: strategy {idx} is Necessary to achieve Goal G (Confidence: should)",
+                    base_keywords=[f"k{idx}"],
+                    advisor=lambda rule, _similar, _task: {
+                        "operation": "ADD",
+                        "rule": rule,
+                        "reason": "force_add_for_prune_contract",
+                    },
+                )
+            self.assertEqual(len(memory.memory_db), 2)
+            self.assertLessEqual(len(json.loads((Path(tmp) / "memory.json").read_text(encoding="utf-8"))), 2)
 
 
 if __name__ == "__main__":

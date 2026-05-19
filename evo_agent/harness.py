@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -92,7 +93,9 @@ class HarnessOrchestrator:
         self.image_dir = image_dir
         self.base_model = self.config.model_name
         self.planner = Planner()
-        self.memory = SkepticalMemoryManager(self.config.memory_db_path)
+        self.memory = SkepticalMemoryManager(
+            self.config.memory_db_path, max_rules=self.config.memory_max_rules
+        )
         self.compiler = CognitiveCompiler(
             ref_model=self.config.reflection_model_name,
             base_url=self.config.reflection_base_url,
@@ -571,10 +574,13 @@ class HarnessOrchestrator:
         start: int = 0,
         trajectory_dir: Optional[str] = None,
         resume: bool = False,
+        continue_on_error: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         results = []
         output_path = output_path or str(Path(self.config.result_dir) / "predictions.jsonl")
+        continue_on_error = self.config.batch_continue_on_error if continue_on_error is None else continue_on_error
         completed_indices = self._read_completed_indices(output_path) if resume else set()
+        status_counts: dict[str, int] = {}
         if Path(output_path).exists() and not resume:
             Path(output_path).unlink()
         for case in self.load_next_case():
@@ -585,7 +591,29 @@ class HarnessOrchestrator:
                 continue
             if limit is not None and len(results) >= limit:
                 break
-            result = self.run_case(case, trajectory_dir=trajectory_dir)
+            try:
+                result = self.run_case(case, trajectory_dir=trajectory_dir)
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+                logger.error("case %s failed with uncaught exception: %s", case.task_id, exc, exc_info=True)
+                result = {
+                    "task_id": case.task_id or f"case_{case.index}",
+                    "answer": "",
+                    "pred": "",
+                    "steps": 0,
+                    "trajectory_path": "",
+                    "summary": {},
+                    "success": False,
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                    "exit_status": f"uncaught_{type(exc).__name__}",
+                    "api_calls": 0,
+                    "total_tokens": 0,
+                    "reflection": None,
+                    "memory_write": None,
+                    "applied_rules": [],
+                    "traceback": traceback.format_exc(),
+                }
             export_image = case.metadata.get("submission_image") if isinstance(case.metadata, dict) else None
             self.export_logs(
                 output_path,
@@ -596,6 +624,9 @@ class HarnessOrchestrator:
                 pred=result["pred"],
             )
             results.append(result)
+            status = str(result.get("exit_status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            self._write_batch_status(output_path, status_counts, results)
             logger.info(
                 "case %s done steps=%s pred=%s",
                 case.task_id,
@@ -603,6 +634,19 @@ class HarnessOrchestrator:
                 result["pred"][:120],
             )
         return results
+
+    def _write_batch_status(
+        self, output_path: str, status_counts: dict[str, int], results: list[dict[str, Any]]
+    ) -> None:
+        status_path = Path(output_path).with_suffix(Path(output_path).suffix + ".status.json")
+        summary = {
+            "total_processed_this_run": len(results),
+            "exit_status_counts": status_counts,
+            "total_api_calls": sum(int(item.get("api_calls", 0)) for item in results),
+            "total_tokens": sum(int(item.get("total_tokens", 0)) for item in results),
+            "updated_at": time.time(),
+        }
+        status_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _read_completed_indices(self, output_path: str) -> set[int]:
         path = Path(output_path)

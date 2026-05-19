@@ -44,6 +44,7 @@ class HarnessConfig:
     llm_retry_min_seconds: float = field(default_factory=lambda: _env_float("LLM_RETRY_MIN_SECONDS", "1"))
     llm_retry_max_seconds: float = field(default_factory=lambda: _env_float("LLM_RETRY_MAX_SECONDS", "8"))
     context_recent_steps: int = field(default_factory=lambda: _env_int("CONTEXT_RECENT_STEPS", "8"))
+    batch_continue_on_error: bool = field(default_factory=lambda: _env_bool("BATCH_CONTINUE_ON_ERROR", "1"))
 
     trajectory_dir: str = field(
         default_factory=lambda: os.getenv("TRAJECTORY_DIR", str(PACKAGE_ROOT / "trajectories"))
@@ -51,6 +52,7 @@ class HarnessConfig:
     memory_db_path: str = field(
         default_factory=lambda: os.getenv("MEMORY_DB_PATH", str(PACKAGE_ROOT / "memory.json"))
     )
+    memory_max_rules: int = field(default_factory=lambda: _env_int("MEMORY_MAX_RULES", "64"))
 
     reflection_enabled: bool = field(default_factory=lambda: os.getenv("REFLECTION_ENABLED", "1") != "0")
     reflection_model_enabled: bool = field(default_factory=lambda: _env_bool("REFLECTION_MODEL_ENABLED", "0"))

@@ -31,9 +31,18 @@ Commit: `b596ab4`
 
 ## Iteration 3: Reference Repo Stability Patterns
 
-Commit: this commit
+Commit: `f9d54f9`
 
 - 参考 mini-swe-agent 的模型调用重试，加入指数退避和非重试错误识别。
 - 参考 mini-swe-agent 的 benchmark 跳过机制，加入 `--resume` 断点续跑。
 - 参考 CLIN 的最近 action-observation 上下文裁剪，加入 `CONTEXT_RECENT_STEPS`。
 - 扩展接口契约测试，覆盖上下文裁剪和 resume 行为。
+
+## Iteration 4: Batch Fault Tolerance And Memory Pruning
+
+Commit: this commit
+
+- 参考 mini-swe-agent 的 per-instance exception handling，批量默认单样本失败后继续跑。
+- 为预测 JSONL 旁路生成 `*.status.json`，记录 exit status、API calls 和 token 汇总。
+- 参考 ExpeL 的 bounded rule list，新增 `MEMORY_MAX_RULES` 并自动裁剪低价值规则。
+- 扩展接口契约测试，覆盖批量异常续跑和 Memory 裁剪。
