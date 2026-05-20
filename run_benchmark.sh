@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Keep these overrideable from the shell:
-#   GROUP_ID, TASK_FILE, OUTPUT, RUN_ID, WORKERS, LIMIT, START
+#   GROUP_ID, TASK_FILE, DATASET, OUTPUT, RUN_ID, WORKERS, LIMIT, START
 export LLM_BASE_URL="${LLM_BASE_URL:-https://notebook-inspire.sii.edu.cn/ws-7c23bd1d-9bae-4238-803a-737a35480e18/project-39fbffc7-dcca-4fb4-b43a-2f69f72f7e52/user-b1acf6ce-25a4-4cb6-b428-f427f4a59686/vscode/b2aa27b1-e0f7-425d-b208-acbd7f40ef68/68f1224c-8cc9-4e87-8701-523c6e59db1f/proxy/8000/}"
 export MODEL_NAME="${MODEL_NAME:-Qwen3.5-9B}"
 export REFLECTION_LLM_BASE_URL="${REFLECTION_LLM_BASE_URL:-https://notebook-inspire.sii.edu.cn/ws-7c23bd1d-9bae-4238-803a-737a35480e18/project-39fbffc7-dcca-4fb4-b43a-2f69f72f7e52/user-b1acf6ce-25a4-4cb6-b428-f427f4a59686/vscode/b2aa27b1-e0f7-425d-b208-acbd7f40ef68/68f1224c-8cc9-4e87-8701-523c6e59db1f/proxy/8001/}"
@@ -58,6 +58,8 @@ export RESUME_VALID_ONLY="${RESUME_VALID_ONLY:-0}"
 FRESH_MEMORY="${FRESH_MEMORY:-1}"
 
 RUN_ID="${RUN_ID:-benchmark_$(date +%Y%m%d_%H%M%S)}"
+DATASET="${DATASET:-}"
+DATASET_ROOT="${DATASET_ROOT:-/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets}"
 TASK_FILE="${TASK_FILE:-/inspire/qb-ilm2/project/26summer-camp-01/public/benchmark.csv}"
 OUTPUT="${OUTPUT:-/inspire/qb-ilm2/project/26summer-camp-01/26210500/benchmark_runs/${RUN_ID}/predictions.jsonl}"
 TRAJ_DIR="${TRAJ_DIR:-/inspire/qb-ilm2/project/26summer-camp-01/26210500/benchmark_runs/${RUN_ID}/trajectories}"
@@ -68,7 +70,6 @@ START="${START:-0}"
 mkdir -p "$(dirname "$OUTPUT")" "$TRAJ_DIR" "$SUBMISSION_DIR"
 
 ARGS=(
-  --task-file "$TASK_FILE"
   --output "$OUTPUT"
   --traj-dir "$TRAJ_DIR"
   --run-id "$RUN_ID"
@@ -77,6 +78,15 @@ ARGS=(
   --limit "$LIMIT"
   --resume
 )
+
+if [[ -n "$DATASET" ]]; then
+  ARGS+=(--dataset "$DATASET" --dataset-root "$DATASET_ROOT" --judge-after-run)
+  ARGS+=(--judge-output "${JUDGE_OUTPUT:-${OUTPUT}.judge.jsonl}")
+  export JUDGE_LLM_BASE_URL="${JUDGE_LLM_BASE_URL:-$REFLECTION_LLM_BASE_URL}"
+  export JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-$REFLECTION_MODEL_NAME}"
+else
+  ARGS+=(--task-file "$TASK_FILE")
+fi
 
 if [[ -n "${GROUP_ID:-}" ]]; then
   ARGS+=(--group-id "$GROUP_ID" --submission-dir "$SUBMISSION_DIR")
@@ -87,10 +97,16 @@ if [[ "$FRESH_MEMORY" != "0" ]]; then
 fi
 
 echo "Run ID: $RUN_ID"
-echo "Task file: $TASK_FILE"
+if [[ -n "$DATASET" ]]; then
+  echo "Dataset: $DATASET"
+  echo "Dataset root: $DATASET_ROOT"
+  echo "Judge output: ${JUDGE_OUTPUT:-${OUTPUT}.judge.jsonl}"
+else
+  echo "Task file: $TASK_FILE"
+fi
 echo "Output: $OUTPUT"
 echo "Trajectories: $TRAJ_DIR"
 echo "Workers: $WORKERS  Limit: $LIMIT  Start: $START"
 echo "Fresh memory: $FRESH_MEMORY"
 
-python -m task_runner "${ARGS[@]}"
+${PYTHON_BIN:-python} -m task_runner "${ARGS[@]}"

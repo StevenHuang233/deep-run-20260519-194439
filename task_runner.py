@@ -11,12 +11,14 @@ import time
 
 try:
     from evo_agent.config import HarnessConfig
+    from evo_agent.dataset_adapter import attach_gold_answers, prepare_answered_dataset
     from evo_agent.dreamer import MemoryDreamer
     from evo_agent.harness import HarnessOrchestrator, run_task
     from evo_agent.judge import JudgeConfig, judge_predictions
     from evo_agent.submission import export_group_submission
 except ImportError:
     from .evo_agent.config import HarnessConfig
+    from .evo_agent.dataset_adapter import attach_gold_answers, prepare_answered_dataset
     from .evo_agent.dreamer import MemoryDreamer
     from .evo_agent.harness import HarnessOrchestrator, run_task
     from .evo_agent.judge import JudgeConfig, judge_predictions
@@ -42,6 +44,10 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--task-file", default=None, help="CSV/JSONL task file for batch run")
     p.add_argument("--image-dir", default=None, help="Base directory for relative image paths in JSONL tasks")
+    p.add_argument("--dataset", choices=["2wiki", "simplevqa"], default=None, help="Adapt a local answered dataset for safe inference")
+    p.add_argument("--dataset-root", default="/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets", help="Root containing 2wiki.jsonl and simpleVQA/SimpleVQA.jsonl")
+    p.add_argument("--dataset-task-output", default=None, help="Prepared no-answer task JSONL path")
+    p.add_argument("--dataset-gold-output", default=None, help="Prepared gold-answer sidecar JSONL path")
     p.add_argument("--output", default=None, help="Prediction JSONL output path")
     p.add_argument("--limit", type=int, default=None, help="Optional batch limit")
     p.add_argument("--start", type=int, default=0, help="Start index for batch run")
@@ -59,6 +65,7 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--judge-after-run", action="store_true", help="Run LLM-as-a-judge scoring after batch predictions")
     p.add_argument("--judge-file", default=None, help="Existing prediction JSONL to score without running tasks")
+    p.add_argument("--judge-gold-file", default=None, help="Gold-answer sidecar JSONL to join before judging")
     p.add_argument("--judge-output", default=None, help="Judge detail JSONL output path")
     p.add_argument("--judge-llm-url", default=None, help="OpenAI-compatible judge base URL; /v1 is appended if omitted")
     p.add_argument("--judge-model", default=None, help="Judge model name")
@@ -123,8 +130,18 @@ def main() -> None:
             judge_config.base_url = args.judge_llm_url
         if args.judge_model:
             judge_config.model_name = args.judge_model
+        judge_input_path = prediction_path
+        if args.judge_gold_file:
+            joined_path = str(Path(prediction_path).with_suffix(Path(prediction_path).suffix + ".with_gold.jsonl"))
+            judge_input_path = str(
+                attach_gold_answers(
+                    prediction_path=prediction_path,
+                    gold_path=args.judge_gold_file,
+                    output_path=joined_path,
+                )
+            )
         summary = judge_predictions(
-            prediction_path=prediction_path,
+            prediction_path=judge_input_path,
             output_path=args.judge_output,
             config=judge_config,
             limit=args.judge_limit,
@@ -136,6 +153,8 @@ def main() -> None:
             f"{summary['correct']}/{summary['total']} correct, "
             f"accuracy={summary['accuracy']:.4f}"
         )
+        if judge_input_path != prediction_path:
+            print(f"Judge input with gold: {judge_input_path}")
         print(f"Judge output: {summary['judge_output_path']}")
         return summary
 
@@ -172,6 +191,34 @@ def main() -> None:
             raise SystemExit("--submission-benchmark is required with --submission-from")
         export_submission(args.submission_from, benchmark_path)
         return
+
+    if args.dataset:
+        prediction_output = args.output or str(
+            Path(config.result_dir) / f"{args.dataset}_predictions.jsonl"
+        )
+        prepared_dir = Path(prediction_output).resolve().parent / "prepared_tasks"
+        gold_dir = Path(prediction_output).resolve().parent / "gold"
+        prepared = prepare_answered_dataset(
+            args.dataset,
+            dataset_root=args.dataset_root,
+            task_output=args.dataset_task_output or prepared_dir / f"{args.dataset}.tasks.jsonl",
+            gold_output=args.dataset_gold_output or gold_dir / f"{args.dataset}.gold.jsonl",
+            limit=args.limit,
+            start=args.start,
+        )
+        args.task_file = str(prepared.task_path)
+        if prepared.image_dir and not args.image_dir:
+            args.image_dir = str(prepared.image_dir)
+        args.judge_gold_file = args.judge_gold_file or str(prepared.gold_path)
+        # --start/--limit already sliced the source dataset while preparing.
+        # The batch runner must process the prepared task file from its row 0.
+        args.start = 0
+        args.limit = prepared.total
+        print(
+            "Prepared dataset: "
+            f"{prepared.name} total={prepared.total} "
+            f"tasks={prepared.task_path} gold={prepared.gold_path}"
+        )
 
     if args.task_file:
         prediction_output = args.output or str(Path(config.result_dir) / "predictions.jsonl")
