@@ -68,6 +68,7 @@ class Trajectory:
         self,
         recent_steps: int | None = None,
         include_images: bool = True,
+        max_chars: int | None = None,
     ) -> list[dict]:
         keep_steps: set[int | None] | None = None
         if recent_steps and recent_steps > 0:
@@ -99,7 +100,35 @@ class Trajectory:
             if entry.get("tool_call_id"):
                 msg["tool_call_id"] = entry["tool_call_id"]
             messages.append(msg)
+        if max_chars and max_chars > 0:
+            messages = self._compact_messages_for_model(messages, max_chars=max_chars)
         return messages
+
+    def _compact_messages_for_model(self, messages: list[dict], *, max_chars: int) -> list[dict]:
+        if not messages:
+            return messages
+        total = sum(self._message_size(message) for message in messages)
+        if total <= max_chars:
+            return messages
+
+        protected = messages[:2]
+        protected_size = sum(self._message_size(message) for message in protected)
+        budget = max(0, max_chars - protected_size)
+        kept_reversed: list[dict] = []
+        for message in reversed(messages[2:]):
+            size = self._message_size(message)
+            if kept_reversed and budget - size < 0:
+                break
+            kept_reversed.append(message)
+            budget -= size
+        return protected + list(reversed(kept_reversed))
+
+    def _message_size(self, message: dict) -> int:
+        content = message.get("content") or ""
+        size = len(json.dumps(content, ensure_ascii=False)) if not isinstance(content, str) else len(content)
+        if message.get("tool_calls"):
+            size += len(json.dumps(message.get("tool_calls"), ensure_ascii=False))
+        return size + len(str(message.get("role") or ""))
 
     def _content_without_images(self, content):
         """Drop expensive multimodal image payloads while keeping task text."""

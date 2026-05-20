@@ -13,6 +13,7 @@ from pathlib import Path
 from evo_agent.case_memory import CaseMemoryManager
 from evo_agent.compiler import CognitiveCompiler
 from evo_agent.config import HarnessConfig, normalize_openai_base_url
+from evo_agent.dataset_adapter import attach_gold_answers, prepare_answered_dataset
 from evo_agent.dreamer import MemoryDreamer
 from evo_agent.environment import ToolEnvironment
 from evo_agent.harness import HarnessOrchestrator, _detect_image_suffix
@@ -25,6 +26,93 @@ from evo_agent.types import Role, TaskCase
 
 
 class InterfaceContractTests(unittest.TestCase):
+    def test_answered_dataset_adapter_separates_inference_tasks_from_gold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "datasets"
+            dataset_root.mkdir()
+            (dataset_root / "2wiki.jsonl").write_text(
+                json.dumps(
+                    {
+                        "_id": "case-a",
+                        "question": "Who was born earlier?",
+                        "context": [["A", ["A was born in 1900."]]],
+                        "answer": "A",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            prepared = prepare_answered_dataset(
+                "2wiki",
+                dataset_root=dataset_root,
+                task_output=root / "tasks.jsonl",
+                gold_output=root / "gold.jsonl",
+            )
+            task_row = json.loads(prepared.task_path.read_text(encoding="utf-8").splitlines()[0])
+            gold_row = json.loads(prepared.gold_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotIn("answer", task_row)
+            self.assertEqual(gold_row["answer"], "A")
+
+            predictions = root / "predictions.jsonl"
+            predictions.write_text(
+                json.dumps({"index": 0, "instruction": "Who was born earlier?", "pred": "A"}) + "\n",
+                encoding="utf-8",
+            )
+            judge_input = attach_gold_answers(predictions, prepared.gold_path, root / "judge_input.jsonl")
+            joined = json.loads(judge_input.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(joined["answer"], "A")
+            self.assertEqual(joined["reference_answer"], "A")
+
+    def test_prepared_simplevqa_task_does_not_leak_answer_to_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            simple_root = root / "datasets" / "simpleVQA"
+            simple_root.mkdir(parents=True)
+            image_dir = simple_root / "images"
+            image_dir.mkdir()
+            (image_dir / "x.jpg").write_bytes(b"not-a-real-image")
+            (simple_root / "SimpleVQA.jsonl").write_text(
+                json.dumps(
+                    {
+                        "data_id": 7,
+                        "question": "What is shown?",
+                        "answer": "SECRET_GOLD",
+                        "image": "images/x.jpg",
+                        "image_url": "",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            prepared = prepare_answered_dataset(
+                "simplevqa",
+                dataset_root=root / "datasets",
+                task_output=root / "tasks.jsonl",
+                gold_output=root / "gold.jsonl",
+            )
+            config = HarnessConfig(
+                mock_llm=True,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = HarnessOrchestrator(
+                task_file=str(prepared.task_path),
+                image_dir=str(prepared.image_dir),
+                config=config,
+            )
+            case = next(orch.load_next_case())
+            self.assertEqual(case.answer, "")
+            self.assertNotIn("SECRET_GOLD", case.instruction)
+            result = orch.run_case(case)
+            rows = [
+                json.loads(line)
+                for line in Path(result["trajectory_path"]).read_text(encoding="utf-8").splitlines()
+            ]
+            user_text = "\n".join(str(row.get("content") or "") for row in rows if row.get("role") == "user")
+            self.assertNotIn("SECRET_GOLD", user_text)
+
     def test_tool_schema_names_match_existing_services(self) -> None:
         names = [tool["function"]["name"] for tool in ToolEnvironment().schemas]
         self.assertEqual(
@@ -330,6 +418,122 @@ class InterfaceContractTests(unittest.TestCase):
             self.assertFalse(
                 any(row.get("event_type") == "case_memory_candidate_answer_review" for row in rows)
             )
+
+    def test_pre_tool_explicit_answer_gate_submits_before_tool_execution(self) -> None:
+        class _Function:
+            name = "search_text"
+            arguments = json.dumps({"query": "extra verification"})
+
+        class _ToolCall:
+            id = "call_1"
+            function = _Function()
+            type = "function"
+            index = 0
+
+            def model_dump(self):
+                return {
+                    "id": self.id,
+                    "type": self.type,
+                    "function": {
+                        "name": self.function.name,
+                        "arguments": self.function.arguments,
+                    },
+                    "index": self.index,
+                }
+
+        class _Message:
+            content = ""
+            tool_calls = [_ToolCall()]
+            reasoning_content = "Based on the evidence, Toke Makinwa is the influencer in question. Let me verify one more page."
+
+        class _Choice:
+            message = _Message()
+
+        class _Response:
+            choices = [_Choice()]
+            usage = None
+
+        class _Completions:
+            def __init__(self) -> None:
+                self.kwargs = []
+
+            def create(self, **kwargs):
+                self.kwargs.append(kwargs)
+                return _Response()
+
+        class _Chat:
+            def __init__(self) -> None:
+                self.completions = _Completions()
+
+        class _Client:
+            def __init__(self) -> None:
+                self.chat = _Chat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = HarnessConfig(
+                mock_llm=True,
+                max_steps=5,
+                reflection_enabled=False,
+                case_memory_enabled=True,
+                case_memory_model_enabled=False,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+                case_memory_log_path=str(root / "case_memory.jsonl"),
+                strategy_memory_path=str(root / "strategy_memory.jsonl"),
+            )
+            orch = HarnessOrchestrator(config=config)
+            orch.config.mock_llm = False
+            orch.client = _Client()
+            result = orch.run_case(TaskCase(index=0, instruction="Who?", task_id="pre_tool_submit"))
+            self.assertEqual(result["exit_status"], "pre_tool_answer_submitted")
+            self.assertEqual(result["pred"], "toke makinwa")
+            rows = [
+                json.loads(line)
+                for line in Path(result["trajectory_path"]).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(any(row.get("event_type") == "pre_tool_answer_gate" for row in rows))
+            self.assertFalse(any(row.get("role") == "tool" for row in rows))
+
+    def test_pre_tool_gate_ignores_non_final_candidate_mentions(self) -> None:
+        class _Function:
+            name = "search_text"
+            arguments = json.dumps({"query": "Toke Makinwa verify"})
+
+        class _ToolCall:
+            id = "call_1"
+            function = _Function()
+            type = "function"
+            index = 0
+
+            def model_dump(self):
+                return {
+                    "id": self.id,
+                    "type": self.type,
+                    "function": {
+                        "name": self.function.name,
+                        "arguments": self.function.arguments,
+                    },
+                    "index": self.index,
+                }
+
+        class _Message:
+            tool_calls = [_ToolCall()]
+            content = ""
+            reasoning_content = "Let me verify Toke Makinwa before answering."
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = HarnessConfig(
+                mock_llm=True,
+                max_steps=5,
+                result_dir=str(root / "outputs"),
+                trajectory_dir=str(root / "trajectories"),
+                memory_db_path=str(root / "memory.json"),
+            )
+            orch = HarnessOrchestrator(config=config)
+            self.assertEqual(orch._extract_pre_tool_final_answer(_Message.content, _Message.reasoning_content), "")
 
     def test_search_tool_concurrency_limit_is_configurable(self) -> None:
         env = ToolEnvironment(

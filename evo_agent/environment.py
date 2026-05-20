@@ -428,6 +428,7 @@ class ToolEnvironment:
     def _browser_navigate(self, args: dict[str, Any]) -> Any:
         from tools.browser_tool import browser_navigate
 
+        args = self._sanitize_browser_navigate_args(args)
         return browser_navigate(**args)
 
     def _browser_get_text(self, args: dict[str, Any]) -> Any:
@@ -449,6 +450,22 @@ class ToolEnvironment:
         from tools.browser_tool import browser_parallel
 
         bounded_args = dict(args)
+        if "url" in bounded_args and "urls" not in bounded_args:
+            value = bounded_args.pop("url")
+            bounded_args["urls"] = [value] if value else []
         requested = int(bounded_args.get("max_concurrency", self.browser_tool_max_concurrency))
         bounded_args["max_concurrency"] = max(1, min(requested, self.browser_tool_max_concurrency))
         return browser_parallel(**bounded_args)
+
+    def _sanitize_browser_navigate_args(self, args: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(args or {})
+        if "max_chars" in cleaned and "max_text" not in cleaned:
+            cleaned["max_text"] = cleaned.pop("max_chars")
+        else:
+            cleaned.pop("max_chars", None)
+        if "wait_timeout" in cleaned and "timeout" not in cleaned:
+            cleaned["timeout"] = cleaned.pop("wait_timeout")
+        else:
+            cleaned.pop("wait_timeout", None)
+        cleaned.pop("fetch", None)
+        return cleaned

@@ -50,6 +50,7 @@ class HarnessConfig:
     min_p: float = field(default_factory=lambda: _env_float("MIN_P", "0.0"))
     presence_penalty: float = field(default_factory=lambda: _env_float("PRESENCE_PENALTY", "1.5"))
     repetition_penalty: float = field(default_factory=lambda: _env_float("REPETITION_PENALTY", "1.0"))
+    cz_sampling_compat: bool = field(default_factory=lambda: _env_bool("CZ_SAMPLING_COMPAT", "1"))
     disable_tools: bool = field(default_factory=lambda: _env_bool("DISABLE_TOOLS", "0"))
     disable_browser_tools: bool = field(default_factory=lambda: _env_bool("DISABLE_BROWSER_TOOLS", "0"))
     mock_llm: bool = field(default_factory=lambda: _env_bool("MOCK_LLM", "0"))
@@ -72,7 +73,14 @@ class HarnessConfig:
     max_search_calls_per_case: int = field(default_factory=lambda: _env_int("MAX_SEARCH_CALLS_PER_CASE", "32"))
     browser_url_failure_limit: int = field(default_factory=lambda: _env_int("BROWSER_URL_FAILURE_LIMIT", "2"))
     max_tool_calls_per_step: int = field(default_factory=lambda: _env_int("MAX_TOOL_CALLS_PER_STEP", "3"))
+    pre_tool_answer_gate_enabled: bool = field(
+        default_factory=lambda: _env_bool("PRE_TOOL_ANSWER_GATE_ENABLED", "0")
+    )
     context_recent_steps: int = field(default_factory=lambda: _env_int("CONTEXT_RECENT_STEPS", "20"))
+    context_max_chars: int = field(default_factory=lambda: _env_int("CONTEXT_MAX_CHARS", "120000"))
+    search_novelty_guard_enabled: bool = field(
+        default_factory=lambda: _env_bool("SEARCH_NOVELTY_GUARD_ENABLED", "0")
+    )
     batch_continue_on_error: bool = field(default_factory=lambda: _env_bool("BATCH_CONTINUE_ON_ERROR", "1"))
     min_model_attempts: int = field(default_factory=lambda: _env_int("MIN_MODEL_ATTEMPTS", "2"))
     resume_valid_only: bool = field(default_factory=lambda: _env_bool("RESUME_VALID_ONLY", "0"))
@@ -83,7 +91,7 @@ class HarnessConfig:
     forced_answer_use_reflection: bool = field(default_factory=lambda: _env_bool("FORCED_ANSWER_USE_REFLECTION", "0"))
     case_reflection_attempts: int = field(
         default_factory=lambda: _env_int(
-            "CASE_REFLECTION_ATTEMPTS", os.getenv("SELF_REFLECTION_ATTEMPTS", "1")
+            "CASE_REFLECTION_ATTEMPTS", os.getenv("SELF_REFLECTION_ATTEMPTS", "0")
         )
     )
     case_reflection_max_steps: int = field(
@@ -100,6 +108,9 @@ class HarnessConfig:
     )
     memory_max_rules: int = field(default_factory=lambda: _env_int("MEMORY_MAX_RULES", "64"))
     memory_retrieve_top_k: int = field(default_factory=lambda: _env_int("MEMORY_RETRIEVE_TOP_K", "0"))
+    clin_memory_write_enabled: bool = field(
+        default_factory=lambda: _env_bool("CLIN_MEMORY_WRITE_ENABLED", "0")
+    )
     dream_max_trajectories: int = field(default_factory=lambda: _env_int("DREAM_MAX_TRAJECTORIES", "64"))
     dream_min_failures: int = field(default_factory=lambda: _env_int("DREAM_MIN_FAILURES", "1"))
     dream_report_path: str = field(

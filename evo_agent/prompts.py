@@ -280,8 +280,11 @@ SHORT_ANSWER_REPAIR_PROMPT = (
     "只根据题目、图片上下文和已有 Observation，抽取题目真正要求的最短答案字段。"
     "如果题目问年份就只给年份，问地点/人物/实体就给对应名称，问 yes/no 就明确回答并保留必要限定。"
     "如果上一条里已经出现候选答案，只保留候选答案本身，不要保留 based on、likely、证据说明或 Markdown。\n"
-    "如果证据不完整，也必须选择已有观察中最具体、最可能的候选答案；不要返回空、拒答或不确定占位词。\n"
-    "只返回题目要求的最短答案字段；不要输出 <answer> 标签、解释、证据列表、unknown、Unknown、unable、cannot、insufficient、not enough information、无法确定、信息不足、证据不足或工具失败文本。"
+    "现在按“提交答案优先”处理：先在心里从已有 Observation、候选实体、标题、摘要和上一条输出中选出最像题目目标字段的一个具体候选；"
+    "即使证据不完整，也输出这个具体候选本身。"
+    "不要输出任何语言的“未知/没找到/无法确定/信息不足/没有结果/No se encontró/Unknown”等状态描述；这些不是答案。"
+    "如果只能猜，猜已有文本中最接近目标字段的实体、日期、数量或名称，不要解释。\n"
+    "只返回题目要求的最短答案字段；不要输出 <answer> 标签、解释、证据列表、Markdown 或工具失败文本。"
 )
 
 
@@ -294,8 +297,10 @@ def build_forced_evidence_answer_prompt(*, task: str, failure_reason: str, evide
         "请基于题目、图片、已有 search/browser Observation、候选实体和本轮修正策略，给出一个最可能的简短答案。"
         "先确认题目只问哪个字段：年份、地点、人物、实体、数量、颜色、yes/no 或比较结果；最终只输出这个字段。"
         "不要把工具失败、URL、证据句、推理过程或无关中间实体当答案。"
-        "如果证据不完整，也必须选择当前证据中最具体、最可能的简短答案，不能返回空、拒答或不确定占位词。\n"
-        "只返回题目要求的最短答案字段；不要输出 <answer> 标签、Markdown、解释、证据列表、unknown、Unknown、unable、cannot、insufficient、not enough information、无法确定、信息不足、证据不足或工具失败文本。\n\n"
+        "现在必须作出选择：在已有文本里找最接近目标字段的候选实体/日期/数量/名称，选择一个提交。"
+        "不要输出任何语言的“未知、没找到、无法确定、信息不足、没有结果、No se encontró、Unknown、not found”等状态描述；这些会被判为无答案。"
+        "如果候选有多个，优先选择出现频率高、离题目目标字段最近、或来自标题/摘要/正文明确字段的候选。\n"
+        "只返回题目要求的最短答案字段；不要输出 <answer> 标签、Markdown、解释、证据列表或工具失败文本。\n\n"
         f"Task:\n{task}\n\n"
         f"Failure reason:\n{failure_reason or 'none'}\n\n"
         f"Evidence and candidates:\n{evidence}"
@@ -309,8 +314,9 @@ FORCE_ANSWER_PROMPT = (
     "这是本题最后一次作答。不要再调用工具，也不要写工具调用文本。"
     "请基于题目、图片线索、已有 Observation 和常识，直接给出题目所问字段的最短答案。"
     "需要年份就给年份，需要地点/人物/实体就给对应名称，需要 yes/no 就明确回答并保留必要限定。"
-    "不要输出推理过程、证据列表、来源说明、Markdown、unknown、Unknown、unable/cannot/insufficient/not enough information/无法/无法确定/信息不足/证据不足/search timeout/tool failed。"
-    "只返回题目要求的最短答案字段。如果证据不完整，也必须从已有观察中给出最具体、最可能的简短答案。"
+    "现在必须从已有观察中选择一个最具体候选提交；如果证据不完整，也选择最可能的实体、日期、数量或名称。"
+    "不要输出任何语言的“未知、没找到、无法确定、信息不足、没有结果、No se encontró、Unknown、not found”等状态描述。"
+    "只返回题目要求的最短答案字段；不要输出推理过程、证据列表、来源说明、Markdown 或工具失败文本。"
 )
 
 
