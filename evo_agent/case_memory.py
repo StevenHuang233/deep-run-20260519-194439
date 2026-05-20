@@ -278,6 +278,9 @@ class CaseMemoryManager:
         max_model_billion: float,
         case_log_path: str,
         strategy_path: str,
+        candidate_review_base_url: str = "",
+        candidate_review_model_name: str = "",
+        candidate_review_api_key: str = "",
         strategy_top_k: int = 3,
         max_records_prompt: int = 12,
         late_search_threshold: int = 3,
@@ -288,16 +291,23 @@ class CaseMemoryManager:
         self.base_url = base_url
         self.model_name = model_name
         self.api_key = api_key
+        self.candidate_review_base_url = candidate_review_base_url or base_url
+        self.candidate_review_model_name = candidate_review_model_name or model_name
+        self.candidate_review_api_key = candidate_review_api_key or api_key
         self.case_log_path = Path(case_log_path)
         self.strategy_store = StrategyBlockStore(strategy_path, max_blocks=max_strategy_blocks)
         self.strategy_top_k = strategy_top_k
         self.max_records_prompt = max_records_prompt
         self.late_search_threshold = late_search_threshold
         self.client = None
+        self.candidate_review_client = None
         self.generation_config = {
             "enable_thinking": False,
             "temperature": 0.1,
             "top_p": 0.9,
+        }
+        self.candidate_review_generation_config = {
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if self.enable_model:
             assert_model_within_limit(model_name, max_model_billion)
@@ -416,6 +426,9 @@ class CaseMemoryManager:
                     "instruction": "Only check submit-format validity. Return exactly one JSON object with accept.",
                 },
                 max_tokens=120,
+                model=self.candidate_review_model_name,
+                client=self._candidate_review_client(),
+                generation_config=self.candidate_review_generation_config,
             )
             data = self._parse_candidate_answer_review_text(content, issue_type)
             accept = self._as_bool(data.get("accept"))
@@ -428,7 +441,7 @@ class CaseMemoryManager:
                 "retry_memory_block": "",
                 "reason": _compact_text(data.get("reason") or "", 300),
                 "source": "model",
-                "model": self.model_name,
+                "model": self.candidate_review_model_name,
             }
         except Exception as exc:
             review = self._heuristic_candidate_review(
@@ -438,7 +451,7 @@ class CaseMemoryManager:
                 issue_type=issue_type,
                 source="heuristic_fallback",
             )
-            review["model"] = self.model_name
+            review["model"] = self.candidate_review_model_name
             review["error"] = f"{type(exc).__name__}: {exc}"
             return review
 
@@ -503,9 +516,30 @@ class CaseMemoryManager:
         source: str,
     ) -> dict[str, Any]:
         answer = (candidate_answer or "").strip()
+        low = answer.lower()
+        invalid_answer = (
+            not answer
+            or "<tool_call" in low
+            or "<function=" in low
+            or "unknown" in low
+            or low in {"n/a", "na", "none", "null"}
+            or "cannot determine" in low
+            or "unable to determine" in low
+            or "insufficient" in low
+            or "not enough information" in low
+            or low.startswith("the answer is")
+            or low.startswith("answer:")
+            or low.startswith("i think")
+            or low.startswith("i believe")
+            or low.startswith("probably")
+            or answer.startswith("答案是")
+            or "无法确定" in answer
+            or "信息不足" in answer
+            or "证据不足" in answer
+        )
         if issue_type in {"no_answer", "tool_call_leak", "uncertain_answer", "overbroad_answer", "wrong_format"}:
             accept = False
-        elif not answer:
+        elif invalid_answer:
             issue_type = "no_answer"
             accept = False
         elif len(answer) > 180:
@@ -715,17 +749,26 @@ class CaseMemoryManager:
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
-    def _chat_text(self, *, system: str, payload: dict[str, Any], max_tokens: int) -> str:
-        client = self._client()
+    def _chat_text(
+        self,
+        *,
+        system: str,
+        payload: dict[str, Any],
+        max_tokens: int,
+        model: str | None = None,
+        client: Any | None = None,
+        generation_config: dict[str, Any] | None = None,
+    ) -> str:
+        client = client or self._client()
         response = client.chat.completions.create(
-            model=self.model_name,
+            model=model or self.model_name,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             max_tokens=max_tokens,
             temperature=0.1,
-            extra_body=self.generation_config,
+            extra_body=generation_config or self.generation_config,
         )
         return response.choices[0].message.content or ""
 
@@ -739,6 +782,17 @@ class CaseMemoryManager:
             api_key=self.api_key,
         )
         return self.client
+
+    def _candidate_review_client(self):
+        if self.candidate_review_client is not None:
+            return self.candidate_review_client
+        from openai import OpenAI
+
+        self.candidate_review_client = OpenAI(
+            base_url=normalize_openai_base_url(self.candidate_review_base_url),
+            api_key=self.candidate_review_api_key,
+        )
+        return self.candidate_review_client
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         text = (text or "").strip()

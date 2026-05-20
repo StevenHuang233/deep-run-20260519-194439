@@ -126,14 +126,21 @@ SEARCH_CHAIN_REFLECTION_PROMPT = """你是一个搜索链复盘器，负责审�
 
 
 # Used by: CaseMemoryManager.review_candidate_answer.
-# Purpose: 32B only checks whether the extracted candidate text is submit-format valid.
+# Purpose: 9B only checks whether the extracted candidate text is submit-format valid.
 CANDIDATE_ANSWER_REVIEW_PROMPT = """你是候选答案格式审核器。
 
 你只会看到本地程序提前抽取后的候选答案文本，不会看到题目、检索记录、历史策略或证据上下文。
 
-只判断格式是否可提交：
-- 非空、不是拒答、不是工具调用、不是解释/推理过程、不是占位符/坏 JSON，则 accept=true。
-- 空文本、unknown/无法确定/信息不足、工具调用文本、长解释、占位符，则 accept=false。
+只看 candidate_answer。candidate_answer 必须已经是可以直接提交的答案值本身，不需要再从句子里抽取。
+
+返回 {"accept": true} 的情况：
+- 短数字、实体、日期、地点、人名、作品名、国家/机构名、yes/no。
+- 只包含 final_answer 或 answer 字段的极短 JSON，且字段值是短答案。
+
+返回 {"accept": false} 的情况：
+- 空文本、unknown、N/A、无法确定、信息不足、证据不足。
+- 工具调用、JSON 工具参数、搜索请求、推理过程、解释性长句、占位符。
+- 需要再抽取的句子，例如 "The answer is Snow Beer."、"答案是 Snow Beer"、"I think the answer is ..."。
 
 不要判断事实是否正确、证据是否足够、是否答对题目字段；也不要改写或补充答案。
 
@@ -194,16 +201,19 @@ STRATEGY_WRITE_PROMPT = """你是跨case策略整理器。
 
 硬性约束：
 - 不保存具体题目的最终答案、隐藏答案、具体不可泛化实体。
+- 不要引用 prediction、candidate_answer、raw_candidate、retrieval_records 中出现的具体最终数值、实体名、短答案片段或原句。
+- 即使检索记录里有很好的命中例子，也只能概括成“若命中 <requested field> 的明确数值/实体”，不能把该数值/实体写进 strategy。
 - 可以保留查询模板，但必须用占位符，如 <rare entity>、<visible text>、<requested field>。
 - 如果是 LLM/tool/代理/超时/gate 等意外情况，不要写策略，交给原反思兜底。
 - strategy 必须是一段可直接给模型的策略说明，使用自然语言文本块而不是 CLIN 规则。
 - strategy 必须包含明确收束条件：当已有候选能回答题目字段时应停止搜索并输出答案，不能鼓励无止境验证。
 - 避免使用“继续验证、进一步确认、多搜几个来源”等开放式措辞；如需核验，只写一次最关键核验步骤。
+- 如果无法在不包含本题具体答案/实体/原句的情况下写出策略，返回 {"should_write": false, "strategy": ""}。
 
 只输出一个最小 JSON 对象，不要输出 Markdown、代码块或额外解释。字段必须如下：
 {
   "should_write": true,
-  "strategy": "一段中文可迁移策略：说明同类题在什么情况下应采用什么检索/推理顺序，以及应避免什么；可以使用 <rare entity>、<visible text>、<requested field> 等占位符，不能包含本题具体答案"
+  "strategy": "一段中文可迁移策略：说明同类题在什么情况下应采用什么检索/推理顺序，以及应避免什么；必须使用 <rare entity>、<visible text>、<requested field>、<specific date>、<numeric answer> 等占位符，不能包含本题具体答案、实体名或检索原句"
 }
 如果不应该写策略，返回 {"should_write": false, "strategy": ""}。
 """

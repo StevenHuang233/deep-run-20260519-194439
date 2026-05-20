@@ -151,6 +151,21 @@ class HarnessConfig:
         )
     )
     case_memory_api_key: str = field(default_factory=lambda: os.getenv("CASE_MEMORY_API_KEY", "EMPTY"))
+    candidate_review_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "CANDIDATE_REVIEW_LLM_BASE_URL",
+            os.getenv("LLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+        )
+    )
+    candidate_review_model_name: str = field(
+        default_factory=lambda: os.getenv(
+            "CANDIDATE_REVIEW_MODEL_NAME",
+            os.getenv("MODEL_NAME", "qwen-3.5"),
+        )
+    )
+    candidate_review_api_key: str = field(
+        default_factory=lambda: os.getenv("CANDIDATE_REVIEW_API_KEY", "EMPTY")
+    )
     case_memory_log_path: str = field(
         default_factory=lambda: os.getenv(
             "CASE_MEMORY_LOG_PATH",
