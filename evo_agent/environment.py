@@ -236,10 +236,10 @@ class ToolEnvironment:
         self.search_semaphore = _shared_semaphore("search", self.search_tool_max_concurrency)
         self.browser_semaphore = _shared_semaphore("browser", self.browser_tool_max_concurrency)
         if search_text_default_fetch is None:
-            search_text_default_fetch = _env_bool("SEARCH_TEXT_DEFAULT_FETCH", "0")
+            search_text_default_fetch = _env_bool("SEARCH_TEXT_DEFAULT_FETCH", "1")
         self.search_text_default_fetch = bool(search_text_default_fetch)
         if search_image_default_fetch is None:
-            search_image_default_fetch = _env_bool("SEARCH_IMAGE_DEFAULT_FETCH", "0")
+            search_image_default_fetch = _env_bool("SEARCH_IMAGE_DEFAULT_FETCH", "1")
         self.search_image_default_fetch = bool(search_image_default_fetch)
         if search_text_broad_query_fetch is None:
             search_text_broad_query_fetch = _env_bool("SEARCH_TEXT_BROAD_QUERY_FETCH", "0")
@@ -395,9 +395,6 @@ class ToolEnvironment:
             return True
         if not self.search_text_default_fetch:
             return False
-        words = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", query.lower())
-        if len(words) <= 4 and not re.search(r"https?://|site:|\"[^\"]+\"", query):
-            return self.search_text_broad_query_fetch
         return True
 
     def _search_image(self, args: dict[str, Any]) -> Any:
