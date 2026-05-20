@@ -1,0 +1,12 @@
+{
+  "total_processed_this_run": 100,
+  "exit_status_counts": {
+    "submitted": 68,
+    "answer_repaired": 9,
+    "self_reflection_submitted": 18,
+    "forced_answer_submitted": 5
+  },
+  "total_api_calls": 1032,
+  "total_tokens": 4285563,
+  "updated_at": 1779193115.8081026
+}
