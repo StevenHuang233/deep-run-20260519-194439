@@ -206,4 +206,4 @@ class MemoryDreamer:
                 reflection.root_cause,
             ]
         )
-        return sorted(set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.lower())))[:80]
+        return sorted(set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", text.lower())))[:80]

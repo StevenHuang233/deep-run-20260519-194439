@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-ACTIVE_MEMORY_TYPES = {"skill", "bad_pattern", "reflection"}
+ACTIVE_MEMORY_TYPES = {"skill", "bad_pattern", "reflection", "query_strategy"}
 
 
 def _now_iso() -> str:
@@ -21,7 +21,7 @@ def _now_iso() -> str:
 
 
 def _tokens(text: str) -> set[str]:
-    return set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", (text or "").lower()))
+    return set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", (text or "").lower()))
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -121,7 +121,18 @@ class SkepticalMemoryManager:
         entry.setdefault("task_type", "general")
         entry.setdefault("title", self._title_from_content(entry.get("content") or entry.get("rule", "")))
         entry.setdefault("trigger_pattern", entry.get("title", "General reusable task-solving pattern."))
-        entry["trigger_keywords"] = _as_list(entry.get("trigger_keywords") or entry.get("keywords"))[:80]
+        entry["query_templates"] = _as_list(entry.get("query_templates") or entry.get("query_template"))[:8]
+        entry["prioritize_keywords"] = _as_list(entry.get("prioritize_keywords"))[:16]
+        entry["fact_slots"] = _as_list(entry.get("fact_slots"))[:10]
+        entry["tool_sequence"] = _as_list(entry.get("tool_sequence"))[:8]
+        entry["lesson_type"] = str(entry.get("lesson_type") or "").strip()
+        keyword_source = (
+            entry.get("trigger_keywords")
+            or entry.get("keywords")
+            or entry.get("prioritize_keywords")
+            or entry.get("fact_slots")
+        )
+        entry["trigger_keywords"] = _as_list(keyword_source)[:80]
         entry.setdefault("content", entry.get("rule", ""))
         entry["procedure"] = _as_list(entry.get("procedure"))
         entry["avoid"] = _as_list(entry.get("avoid"))
@@ -194,6 +205,8 @@ class SkepticalMemoryManager:
         self, instruction: str, task_type: str = "general", top_k: int = 3
     ) -> list[dict[str, Any]]:
         """Hybrid dense/lexical retrieval with skeptical reranking."""
+        if top_k <= 0:
+            return []
         query_text = self.build_query_text(instruction, task_type)
         active = [
             entry
@@ -239,12 +252,16 @@ class SkepticalMemoryManager:
             f"Task type: {self._normalize_task_type(task_type)}. "
             f"Question: {question}. "
             f"Likely pattern: {pattern}. "
-            "Need: reusable strategy, warnings, and short supported answer."
+            "Need: reusable Track-D strategy for tool planning, fact-slot order, visual grounding, "
+            "early query templates, keyword promotion, browser fallback, or concise final-answer collection."
         )
 
     def format_memories_for_prompt(self, memories: list[dict[str, Any]]) -> list[str]:
         formatted = []
         for mem in memories:
+            if mem.get("memory_type") == "query_strategy":
+                formatted.append(self._format_query_strategy_memory(mem))
+                continue
             prefix = "Relevant Skill" if mem.get("memory_type") == "skill" else "Execution Warning"
             procedure = "; ".join(_as_list(mem.get("procedure"))[:5])
             avoid = "; ".join(_as_list(mem.get("avoid"))[:4])
@@ -257,9 +274,40 @@ class SkepticalMemoryManager:
                 parts.append(f"Procedure: {procedure}")
             if avoid:
                 parts.append(f"Avoid: {avoid}")
-            parts.append("Use as a general hint, not as a factual answer.")
+            parts.append(
+                "Use as a strategy hint only; never use as a factual answer for the current case."
+            )
             formatted.append(" ".join(part for part in parts if part.strip()))
         return formatted
+
+    def _format_query_strategy_memory(self, mem: dict[str, Any]) -> str:
+        templates = "; ".join(_as_list(mem.get("query_templates"))[:4])
+        keywords = ", ".join(_as_list(mem.get("prioritize_keywords"))[:8])
+        slots = " -> ".join(_as_list(mem.get("fact_slots"))[:6])
+        sequence = " -> ".join(_as_list(mem.get("tool_sequence"))[:5])
+        procedure = "; ".join(_as_list(mem.get("procedure"))[:5])
+        avoid = "; ".join(_as_list(mem.get("avoid"))[:4])
+        parts = [
+            f"[Query Strategy: {mem.get('title', 'Untitled')}]",
+            f"Trigger: {mem.get('trigger_pattern', '')}",
+        ]
+        if templates:
+            parts.append(f"Early query template: {templates}")
+        if keywords:
+            parts.append(f"Prioritize keywords: {keywords}")
+        if slots:
+            parts.append(f"Fact slots: {slots}")
+        if sequence:
+            parts.append(f"Tool order: {sequence}")
+        parts.append(f"Do: {mem.get('content', '')}")
+        if procedure:
+            parts.append(f"Procedure: {procedure}")
+        if avoid:
+            parts.append(f"Avoid: {avoid}")
+        parts.append(
+            "Use as a search strategy hint only; never use as a factual answer for the current case."
+        )
+        return " ".join(part for part in parts if part.strip())
 
     # ------------------------------------------------------------------
     # Writing, validation, and merge
@@ -273,6 +321,7 @@ class SkepticalMemoryManager:
         memory_type: str = "reflection",
         task_type: str = "general",
         episode_id: str | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Validate and ADD/EDIT/IGNORE a candidate memory."""
         clean_rule = re.sub(r"\s+", " ", (new_rule or "").strip())
@@ -284,6 +333,7 @@ class SkepticalMemoryManager:
             memory_type=memory_type,
             task_type=task_type,
             episode_id=episode_id,
+            extra_fields=extra_fields,
         )
         validation = self.validate_candidate_memory(candidate)
         if not validation["ok"]:
@@ -305,6 +355,7 @@ class SkepticalMemoryManager:
                 "memory_id": advice.get("target_id"),
                 "rule": str(advice.get("rule") or clean_rule),
                 "reason": advice.get("reason", "ignored_by_advisor"),
+                **self._advisor_metadata(advice),
             }
         if operation == "EDIT":
             target = self._find_target(advice.get("target_id"), similar)
@@ -320,10 +371,19 @@ class SkepticalMemoryManager:
             return {"ok": False, "reason": "unsupported_memory_type"}
         if not str(memory.get("trigger_pattern", "")).strip():
             return {"ok": False, "reason": "missing_trigger_pattern"}
-        if not memory.get("procedure") and not memory.get("avoid"):
+        if self._is_generic_trigger(str(memory.get("trigger_pattern", ""))):
+            return {"ok": False, "reason": "generic_trigger_pattern"}
+        if memory.get("memory_type") == "query_strategy" and not any(
+            memory.get(field)
+            for field in ("query_templates", "prioritize_keywords", "fact_slots", "tool_sequence", "procedure")
+        ):
+            return {"ok": False, "reason": "missing_query_strategy_payload"}
+        if not memory.get("procedure") and not memory.get("avoid") and memory.get("memory_type") != "query_strategy":
             return {"ok": False, "reason": "missing_procedure_or_avoid"}
         if len(str(memory.get("content", ""))) > 1200:
             return {"ok": False, "reason": "content_too_long"}
+        if self._is_low_quality_reflection_memory(memory):
+            return {"ok": False, "reason": "low_quality_reflection_memory"}
         if self._looks_like_specific_answer(memory):
             return {"ok": False, "reason": "possible_answer_leakage"}
         return {"ok": True, "reason": "valid"}
@@ -351,11 +411,12 @@ class SkepticalMemoryManager:
         candidate["updated_at"] = now
         candidate["last_operation"] = "ADD"
         candidate["last_reason"] = advice.get("reason", "")
+        candidate.update(self._advisor_metadata(advice, prefix="last_"))
         candidate = self._normalize_entry(candidate)
         self.memory_db.append(candidate)
         self._save_db()
         self._append_backup(candidate, "ADD")
-        return {"operation": "ADD", **candidate}
+        return {"operation": "ADD", **candidate, **self._advisor_metadata(advice)}
 
     def _merge_entry(
         self, entry: dict[str, Any], candidate: dict[str, Any], advice: dict[str, Any]
@@ -370,6 +431,15 @@ class SkepticalMemoryManager:
         entry["example_patterns"] = self._merge_lists(
             entry.get("example_patterns"), candidate.get("example_patterns"), max_items=8
         )
+        for field, max_items in (
+            ("query_templates", 8),
+            ("prioritize_keywords", 16),
+            ("fact_slots", 10),
+            ("tool_sequence", 8),
+        ):
+            entry[field] = self._merge_lists(entry.get(field), candidate.get(field), max_items=max_items)
+        if candidate.get("lesson_type") and not entry.get("lesson_type"):
+            entry["lesson_type"] = candidate["lesson_type"]
         if len(candidate.get("content", "")) > len(entry.get("content", "")) * 1.25:
             entry["content"] = candidate["content"]
         entry["embedding_text"] = self.build_embedding_text(entry)
@@ -390,7 +460,16 @@ class SkepticalMemoryManager:
             "old_rule": old_rule,
             "rule": entry.get("rule"),
             "reason": advice.get("reason", ""),
+            **self._advisor_metadata(advice),
         }
+
+    def _advisor_metadata(self, advice: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+        metadata = {}
+        for key in ("advisor_source", "advisor_model", "advisor_error"):
+            value = advice.get(key)
+            if value:
+                metadata[f"{prefix}{key}"] = value
+        return metadata
 
     def _heuristic_advice(
         self, candidate: dict[str, Any], similar_entries: list[dict[str, Any]]
@@ -669,21 +748,50 @@ class SkepticalMemoryManager:
         memory_type: str,
         task_type: str,
         episode_id: str | None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         clean = re.sub(r"\s+", " ", rule.strip())
+        extra = extra_fields or {}
+        clean_type = memory_type if memory_type in ACTIVE_MEMORY_TYPES else "reflection"
+        query_templates = _as_list(extra.get("query_templates") or extra.get("query_template"))[:8]
+        prioritize_keywords = _as_list(extra.get("prioritize_keywords"))[:16]
+        fact_slots = _as_list(extra.get("fact_slots"))[:10]
+        tool_sequence = _as_list(extra.get("tool_sequence"))[:8]
+        procedure = _as_list(extra.get("correct_strategy") or extra.get("procedure")) or self._procedure_from_rule(clean)
+        avoid = _as_list(extra.get("avoid")) or self._avoid_from_rule(clean)
+        trigger_pattern = str(extra.get("trigger_pattern") or self._trigger_from_rule(clean)).strip()
+        content = str(extra.get("content") or self._content_from_rule(clean)).strip()
+        title = str(extra.get("title") or self._title_from_content(content or clean)).strip()
+        keywords = self._memory_keywords(
+            base_keywords=base_keywords,
+            extra_keywords=_as_list(extra.get("trigger_keywords")) + prioritize_keywords,
+            template_texts=query_templates + fact_slots,
+            fallback_text=clean,
+        )
         source_ids = [episode_id] if episode_id else []
         candidate = {
-            "memory_id": _stable_id(memory_type[:5] or "mem", clean),
-            "memory_type": memory_type if memory_type in ACTIVE_MEMORY_TYPES else "reflection",
+            "memory_id": _stable_id(
+                clean_type[:5] or "mem",
+                clean + json.dumps(extra, ensure_ascii=False, sort_keys=True, default=str),
+            ),
+            "memory_type": clean_type,
             "task_type": self._normalize_task_type(task_type),
-            "title": self._title_from_content(clean),
-            "trigger_pattern": self._trigger_from_rule(clean),
-            "trigger_keywords": (base_keywords or sorted(_tokens(clean))[:20])[:80],
-            "content": self._content_from_rule(clean),
-            "procedure": self._procedure_from_rule(clean),
-            "avoid": self._avoid_from_rule(clean),
+            "title": title,
+            "trigger_pattern": trigger_pattern,
+            "trigger_keywords": keywords,
+            "content": content,
+            "procedure": procedure,
+            "avoid": avoid,
             "example_patterns": [],
-            "source": {"source_type": "reflection", "source_episode_ids": source_ids},
+            "lesson_type": str(extra.get("lesson_type") or "").strip(),
+            "query_templates": query_templates,
+            "prioritize_keywords": prioritize_keywords,
+            "fact_slots": fact_slots,
+            "tool_sequence": tool_sequence,
+            "source": {
+                "source_type": "search_chain_reflection" if clean_type == "query_strategy" else "reflection",
+                "source_episode_ids": source_ids,
+            },
             "stats": {"usage_count": 0, "success_count": 0, "failure_count": 0, "confidence": 0.5},
             "status": "active",
             "created_at": _now_iso(),
@@ -697,6 +805,32 @@ class SkepticalMemoryManager:
         candidate["weight"] = 0.5
         return candidate
 
+    def _memory_keywords(
+        self,
+        base_keywords: list[str] | None,
+        extra_keywords: list[str],
+        template_texts: list[str],
+        fallback_text: str,
+    ) -> list[str]:
+        values: list[str] = []
+        values.extend(base_keywords or [])
+        values.extend(extra_keywords)
+        for text in template_texts:
+            values.extend(sorted(_tokens(text))[:8])
+        if not values:
+            values.extend(sorted(_tokens(fallback_text))[:20])
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            item = re.sub(r"\s+", " ", str(value).strip().lower())
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+            if len(merged) >= 80:
+                break
+        return merged
+
     def build_embedding_text(self, memory: dict[str, Any]) -> str:
         return re.sub(
             r"\s+",
@@ -707,6 +841,10 @@ class SkepticalMemoryManager:
                     f"Memory type: {memory.get('memory_type', 'reflection')}.",
                     f"Trigger: {memory.get('trigger_pattern', '')}.",
                     f"Lesson: {memory.get('content', '')}.",
+                    f"Query templates: {'; '.join(_as_list(memory.get('query_templates')))}.",
+                    f"Prioritize keywords: {', '.join(_as_list(memory.get('prioritize_keywords')))}.",
+                    f"Fact slots: {' -> '.join(_as_list(memory.get('fact_slots')))}.",
+                    f"Tool sequence: {' -> '.join(_as_list(memory.get('tool_sequence')))}.",
                     f"Procedure: {'; '.join(_as_list(memory.get('procedure')))}.",
                     f"Avoid: {'; '.join(_as_list(memory.get('avoid')))}.",
                 ]
@@ -714,7 +852,7 @@ class SkepticalMemoryManager:
         )
 
     def _rule_alias(self, memory: dict[str, Any]) -> str:
-        content = str(memory.get("content", "")).strip()
+        content = re.sub(r"^(?:\s*Action:\s*)+", "", str(memory.get("content", "")).strip(), flags=re.I)
         trigger = str(memory.get("trigger_pattern", "")).strip() or "When this task pattern appears"
         relation = "Does Not Contribute" if memory.get("memory_type") == "bad_pattern" else "Necessary"
         return f"[{trigger}] -> Action: {content} is {relation} to achieve Goal G (Confidence: should)"
@@ -722,7 +860,7 @@ class SkepticalMemoryManager:
     def _content_from_rule(self, rule: str) -> str:
         if "->" in rule:
             right = rule.split("->", 1)[1]
-            right = re.sub(r"^Action:\s*", "", right, flags=re.I).strip()
+            right = re.sub(r"^(?:\s*Action:\s*)+", "", right, flags=re.I).strip()
             right = re.sub(r"\s+is\s+(Necessary|Does Not Contribute).*", "", right, flags=re.I).strip()
             return right or rule
         return rule
@@ -731,7 +869,16 @@ class SkepticalMemoryManager:
         match = re.search(r"\[(.*?)\]", rule)
         if match:
             return match.group(1).strip()
-        return "This reusable task-solving pattern is detected."
+        text = rule.lower()
+        if "vqa" in text or "image" in text or "visual" in text or "图" in text:
+            return "When a visual question requires identifying a subject before checking an attribute"
+        if "browser" in text or "http" in text or "timeout" in text or "session" in text:
+            return "When browser or search tools return repeated runtime failures"
+        if "search" in text or "query" in text or "关键词" in text:
+            return "When equivalent search queries stop adding new evidence"
+        if "multi-hop" in text or "intermediate" in text or "director" in text or "founder" in text:
+            return "When the question requires resolving an intermediate entity before the final attribute"
+        return "When a task-solving strategy must be chosen from incomplete evidence"
 
     def _procedure_from_rule(self, rule: str) -> list[str]:
         text = rule.lower()
@@ -763,6 +910,72 @@ class SkepticalMemoryManager:
         if "repeating" in text or "repeated" in text or "error" in text:
             avoid.append("Do not repeat equivalent failing tool calls.")
         return avoid
+
+    def _is_generic_trigger(self, trigger: str) -> bool:
+        normalized = re.sub(r"\s+", " ", trigger.strip().lower())
+        generic = {
+            "this reusable task-solving pattern is detected.",
+            "this reusable task-solving pattern is detected",
+            "general reusable task-solving pattern.",
+            "general reusable task-solving pattern",
+            "when this task pattern appears",
+        }
+        if normalized in generic:
+            return True
+        if len(_tokens(normalized)) < 3 and not re.search(r"\d|[A-Z]", trigger):
+            return True
+        return False
+
+    def _is_low_quality_reflection_memory(self, memory: dict[str, Any]) -> bool:
+        if memory.get("memory_type") != "reflection":
+            return False
+        trigger = str(memory.get("trigger_pattern", "")).strip().lower()
+        content = str(memory.get("content", "")).strip().lower()
+        rule = str(memory.get("rule", "")).strip().lower()
+        generic_fragments = (
+            "be careful",
+            "verify the answer",
+            "verify before answering",
+            "use current evidence",
+            "avoid repeating",
+            "stop repeating",
+            "candidate validation",
+            "subject validation",
+            "cross-checking",
+        )
+        contract_fragments = (
+            "answer contract",
+            "answer_type",
+            "expected answer type",
+            "intermediate entity",
+            "missing slot",
+            "final attribute",
+            "visual subject",
+            "same comparison slot",
+        )
+        if (
+            any(fragment in content or fragment in rule for fragment in generic_fragments)
+            and not any(fragment in content or fragment in rule for fragment in contract_fragments)
+        ):
+            return True
+        if (
+            "equivalent search queries stop adding new evidence" in trigger
+            and "candidate validation" in content
+            and "candidate validation is necessary" in rule
+        ):
+            return True
+        if (
+            "incomplete evidence" in trigger
+            and content
+            in {
+                "candidate validation",
+                "subject validation",
+                "cross-entity validation",
+                "cross-checking with all relational constraints",
+            }
+        ):
+            return True
+        return False
 
     def _title_from_content(self, text: str) -> str:
         clean = re.sub(r"[\[\]<>]", "", text or "").strip()

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+RUN_ID="${RUN_ID:-oop5_10w100_$(date +%Y%m%d_%H%M%S)}"
+BASE_DIR="/inspire/qb-ilm2/project/26summer-camp-01/26210500/benchmark_runs/${RUN_ID}"
+
+export RUN_ID
+export OUTPUT="${OUTPUT:-${BASE_DIR}/predictions.jsonl}"
+export TRAJ_DIR="${TRAJ_DIR:-${BASE_DIR}/trajectories}"
+export SUBMISSION_DIR="${SUBMISSION_DIR:-${BASE_DIR}/submission}"
+
+export WORKERS="${WORKERS:-10}"
+export LIMIT="${LIMIT:-100}"
+export START="${START:-0}"
+export MAX_STEPS="${MAX_STEPS:-20}"
+
+export TEMPERATURE="${TEMPERATURE:-1.0}"
+export TOP_P="${TOP_P:-0.95}"
+export TOP_K="${TOP_K:-20}"
+export MIN_P="${MIN_P:-0.0}"
+export PRESENCE_PENALTY="${PRESENCE_PENALTY:-1.5}"
+export REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
+
+export CONTEXT_RECENT_STEPS="${CONTEXT_RECENT_STEPS:-20}"
+export MAX_SEARCH_CALLS_PER_CASE="${MAX_SEARCH_CALLS_PER_CASE:-32}"
+export SEARCH_STALE_RESULT_LIMIT="${SEARCH_STALE_RESULT_LIMIT:-12}"
+export SEARCH_TEXT_MAX_TOP_K="${SEARCH_TEXT_MAX_TOP_K:-8}"
+export SEARCH_TEXT_MAX_CHARS="${SEARCH_TEXT_MAX_CHARS:-1200}"
+export BROWSER_URL_FAILURE_LIMIT="${BROWSER_URL_FAILURE_LIMIT:-2}"
+export CASE_REFLECTION_MAX_STEPS="${CASE_REFLECTION_MAX_STEPS:-8}"
+export ANSWER_REPAIR_ATTEMPTS="${ANSWER_REPAIR_ATTEMPTS:-4}"
+export FINAL_ANSWER_MAX_ATTEMPTS="${FINAL_ANSWER_MAX_ATTEMPTS:-10}"
+
+./run_benchmark.sh

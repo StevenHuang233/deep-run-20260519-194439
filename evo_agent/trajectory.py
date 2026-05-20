@@ -19,11 +19,13 @@ class Trajectory:
     replayed back into the model context.
     """
 
-    def __init__(self, task_id: str, output_dir: str = "trajectories") -> None:
+    def __init__(self, task_id: str, output_dir: str = "trajectories", reset: bool = False) -> None:
         self.task_id = task_id
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         self.path = out / f"{task_id}.jsonl"
+        if reset and self.path.exists():
+            self.path.unlink()
 
     def write(
         self,
@@ -62,7 +64,11 @@ class Trajectory:
                 rows.append(json.loads(line))
         return rows
 
-    def to_messages(self, recent_steps: int | None = None) -> list[dict]:
+    def to_messages(
+        self,
+        recent_steps: int | None = None,
+        include_images: bool = True,
+    ) -> list[dict]:
         keep_steps: set[int | None] | None = None
         if recent_steps and recent_steps > 0:
             step_ids = sorted(
@@ -84,13 +90,38 @@ class Trajectory:
             role = entry.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
                 continue
-            msg = {"role": role, "content": entry.get("content") or ""}
+            content = entry.get("content") or ""
+            if not include_images:
+                content = self._content_without_images(content)
+            msg = {"role": role, "content": content}
             if role == "assistant" and entry.get("tool_calls"):
                 msg["tool_calls"] = entry["tool_calls"]
             if entry.get("tool_call_id"):
                 msg["tool_call_id"] = entry["tool_call_id"]
             messages.append(msg)
         return messages
+
+    def _content_without_images(self, content):
+        """Drop expensive multimodal image payloads while keeping task text."""
+        if not isinstance(content, list):
+            return content
+        text_parts = []
+        image_count = 0
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                text = item.get("text") or ""
+                if text:
+                    text_parts.append(str(text))
+            elif item.get("type") == "image_url":
+                image_count += 1
+        if image_count:
+            text_parts.append(
+                "[Image omitted from this later turn to reduce cost. "
+                "Use the provided image_url/local_image_path text or prior visual observations if needed.]"
+            )
+        return "\n".join(text_parts).strip()
 
     def summary(self) -> dict:
         entries = self.read_all()

@@ -3,23 +3,34 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import json
 import logging
 import re
+import threading
 import time
 import traceback
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Generator, Optional
 
+from .case_memory import CaseMemoryManager, RetrievalRecord
 from .compiler import CognitiveCompiler
-from .config import HarnessConfig, ensure_output_dirs
+from .config import HarnessConfig, ensure_output_dirs, normalize_openai_base_url
 from .environment import ToolEnvironment
 from .gate import ToolGateBlocked, ToolGateMiddleware
 from .memory import SkepticalMemoryManager
 from .planner import Planner
-from .prompts import SYSTEM_PROMPT
+from .prompts import (
+    FORCE_ANSWER_PROMPT,
+    SHORT_ANSWER_REPAIR_PROMPT,
+    SYSTEM_PROMPT,
+    build_answer_issue_retry_prompt,
+    build_forced_evidence_answer_prompt,
+    build_self_reflection_retry_prompt,
+)
 from .trajectory import Trajectory
 from .types import Reflection, Role, TaskCase
 
@@ -38,8 +49,35 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+_PARTIAL_FINAL_ANSWER_RE = re.compile(r'"final_answer"\s*:\s*"(?P<answer>[^"\n{}]{1,200})', re.S)
+_FINAL_ANSWER_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "final_answer_response",
+        "schema": {
+            "type": "object",
+            "properties": {"final_answer": {"type": "string"}},
+            "required": ["final_answer"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def _normalize_answer(text: str) -> str:
     text = text or ""
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            payload = json.loads(stripped)
+            if isinstance(payload, dict) and payload.get("final_answer") is not None:
+                text = str(payload.get("final_answer") or "")
+        except json.JSONDecodeError:
+            pass
+    else:
+        partial = _PARTIAL_FINAL_ANSWER_RE.search(stripped)
+        if partial:
+            text = partial.group("answer")
     answer_match = re.search(r"<answer>(.*?)</answer>", text, flags=re.S | re.I)
     if answer_match:
         text = answer_match.group(1)
@@ -74,6 +112,34 @@ def _safe_task_id(value: str) -> str:
     return safe.strip("._")[:120] or uuid.uuid4().hex[:8]
 
 
+def _is_http_url(value: str) -> bool:
+    return bool(re.match(r"^https?://", (value or "").strip(), flags=re.I))
+
+
+def _canonical_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value.rstrip("/")
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
+def _url_domain(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        return urlsplit(value).netloc.lower()
+    except ValueError:
+        return ""
+
+
 class HarnessOrchestrator:
     """Coordinates dataset loading, ReAct execution, logs, memory, and reflection."""
 
@@ -104,8 +170,35 @@ class HarnessOrchestrator:
             or self.config.memory_model_enabled,
             max_model_billion=self.config.reflection_model_max_b,
         )
-        self.env = ToolEnvironment()
+        self.case_memory = CaseMemoryManager(
+            enabled=self.config.case_memory_enabled,
+            enable_model=self.config.case_memory_model_enabled,
+            base_url=self.config.case_memory_base_url,
+            model_name=self.config.case_memory_model_name,
+            api_key=self.config.case_memory_api_key,
+            max_model_billion=self.config.reflection_model_max_b,
+            case_log_path=self.config.case_memory_log_path,
+            strategy_path=self.config.strategy_memory_path,
+            strategy_top_k=self.config.strategy_memory_top_k,
+            max_records_prompt=self.config.case_memory_max_records_prompt,
+            late_search_threshold=self.config.case_memory_late_search_threshold,
+            max_strategy_blocks=self.config.strategy_memory_max_blocks,
+        )
+        self.env = ToolEnvironment(
+            disable_browser_tools=self.config.disable_browser_tools,
+            retry_attempts=self.config.tool_retry_attempts,
+            retry_min_seconds=self.config.tool_retry_min_seconds,
+            retry_max_seconds=self.config.tool_retry_max_seconds,
+            search_text_max_top_k=self.config.search_text_max_top_k,
+            search_text_max_chars=self.config.search_text_max_chars,
+            search_tool_max_concurrency=self.config.search_tool_max_concurrency,
+            browser_tool_max_concurrency=self.config.browser_tool_max_concurrency,
+            search_text_default_fetch=self.config.search_text_default_fetch,
+            search_image_default_fetch=self.config.search_image_default_fetch,
+            search_text_broad_query_fetch=self.config.search_text_broad_query_fetch,
+        )
         self.client = None if self.config.mock_llm else self._create_openai_client()
+        self._memory_lock = threading.RLock()
         self.trajectory_log: list[dict[str, Any]] = []
 
     def _create_openai_client(self):
@@ -116,7 +209,7 @@ class HarnessOrchestrator:
                 "openai package is required for real LLM calls. "
                 "Install requirements.txt or set MOCK_LLM=1 for local smoke tests."
             ) from exc
-        return OpenAI(base_url=self.config.llm_base_url, api_key="EMPTY")
+        return OpenAI(base_url=normalize_openai_base_url(self.config.llm_base_url), api_key="EMPTY")
 
     def _call_llm_with_retry(self, request_kwargs: dict[str, Any]) -> tuple[Any, int]:
         max_attempts = max(1, self.config.llm_retry_attempts)
@@ -144,6 +237,26 @@ class HarnessOrchestrator:
                 time.sleep(max(sleep_for, 0))
         message = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown error"
         raise LLMCallFailure(message, attempts)
+
+    def _main_model_extra_body(self, *, enable_thinking: bool) -> dict[str, Any]:
+        return {
+            "enable_thinking": enable_thinking,
+            "top_k": self.config.top_k,
+            "min_p": self.config.min_p,
+            "repetition_penalty": self.config.repetition_penalty,
+        }
+
+    def _apply_main_model_sampling(
+        self,
+        request_kwargs: dict[str, Any],
+        *,
+        enable_thinking: bool,
+    ) -> dict[str, Any]:
+        request_kwargs["temperature"] = self.config.temperature
+        request_kwargs["top_p"] = self.config.top_p
+        request_kwargs["presence_penalty"] = self.config.presence_penalty
+        request_kwargs["extra_body"] = self._main_model_extra_body(enable_thinking=enable_thinking)
+        return request_kwargs
 
     def _is_non_retryable_llm_error(self, exc: Exception) -> bool:
         text = f"{type(exc).__name__}: {exc}".lower()
@@ -188,11 +301,15 @@ class HarnessOrchestrator:
             for idx, row in enumerate(csv.DictReader(f)):
                 instruction = row.get("problem") or row.get("instruction") or ""
                 image_value = (row.get("image") or "").strip()
+                image_url = self._extract_csv_image_url(row)
                 image_path = ""
                 image_b64 = None
                 if image_value:
-                    image_b64 = image_value
-                    image_path = self._materialize_base64_image(idx, image_value)
+                    if _is_http_url(image_value):
+                        image_url = image_url or image_value
+                    else:
+                        image_b64 = image_value
+                        image_path = self._materialize_base64_image(idx, image_value)
                 yield TaskCase(
                     index=idx,
                     instruction=instruction,
@@ -200,12 +317,31 @@ class HarnessOrchestrator:
                     task_id=f"benchmark_{idx:03d}",
                     image=image_path,
                     image_b64=image_b64,
+                    image_url=image_url,
                     metadata={
                         "source": str(path),
                         "raw_image_present": bool(image_value),
                         "submission_image": image_value,
+                        "image_url": image_url,
                     },
                 )
+
+    def _extract_csv_image_url(self, row: dict[str, Any]) -> str:
+        for key in (
+            "image_url",
+            "image_urls",
+            "url",
+            "image_source_url",
+            "source_url",
+            "web_url",
+        ):
+            value = (row.get(key) or "").strip()
+            if not value:
+                continue
+            match = re.search(r"https?://[^\s,;]+", value, flags=re.I)
+            if match:
+                return match.group(0)
+        return ""
 
     def _load_jsonl(self, path: Path) -> Generator[TaskCase, None, None]:
         with open(path, encoding="utf-8") as f:
@@ -217,12 +353,14 @@ class HarnessOrchestrator:
                     image_path = row.get("image") or ""
                     if self.image_dir and image_path:
                         image_path = str(Path(self.image_dir) / image_path)
+                    image_b64 = self._read_local_image_b64(image_path)
                     yield TaskCase(
                         index=idx,
                         instruction=row.get("question", ""),
                         answer=row.get("answer", ""),
                         task_id=f"simplevqa_{row.get('data_id', idx)}",
                         image=image_path,
+                        image_b64=image_b64,
                         image_url=row.get("image_url"),
                         metadata=row,
                     )
@@ -236,11 +374,32 @@ class HarnessOrchestrator:
                         index=idx,
                         instruction=instruction,
                         answer=row.get("answer", ""),
-                        task_id=f"2wiki_{row.get('id', idx)}",
+                        task_id=f"2wiki_{row.get('_id') or row.get('id') or idx}",
                         metadata=row,
                     )
 
-    def _format_2wiki_context(self, context: dict[str, Any], max_chars: int = 12000) -> str:
+    def _format_2wiki_context(self, context: Any, max_chars: int = 12000) -> str:
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except json.JSONDecodeError:
+                return context[:max_chars]
+
+        if isinstance(context, list):
+            blocks = []
+            for item in context:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                title, sent_list = item[0], item[1]
+                if isinstance(sent_list, list):
+                    blocks.append(f"{title}: {' '.join(str(sent) for sent in sent_list)}")
+                else:
+                    blocks.append(f"{title}: {sent_list}")
+            return "\n".join(blocks)[:max_chars]
+
+        if not isinstance(context, dict):
+            return str(context)[:max_chars] if context else ""
+
         titles = context.get("title") or []
         sentences = context.get("sentences") or []
         blocks = []
@@ -248,6 +407,14 @@ class HarnessOrchestrator:
             blocks.append(f"{title}: {' '.join(sent_list)}")
         text = "\n".join(blocks)
         return text[:max_chars]
+
+    def _read_local_image_b64(self, image_path: str) -> str | None:
+        if not image_path:
+            return None
+        path = Path(image_path)
+        if not path.exists() or not path.is_file():
+            return None
+        return base64.b64encode(path.read_bytes()).decode("ascii")
 
     def _materialize_base64_image(self, index: int, image_b64: str) -> str:
         suffix, _ = _detect_image_suffix(image_b64)
@@ -285,7 +452,7 @@ class HarnessOrchestrator:
         max_steps = max_steps or self.config.max_steps
         trajectory_dir = trajectory_dir or self.config.trajectory_dir
         task_id = _safe_task_id(case.task_id or str(uuid.uuid4())[:8])
-        traj = Trajectory(task_id, output_dir=trajectory_dir)
+        traj = Trajectory(task_id, output_dir=trajectory_dir, reset=True)
         gate = ToolGateMiddleware(
             loop_limit=self.config.gate_loop_limit,
             similarity_threshold=self.config.gate_similarity_threshold,
@@ -295,24 +462,40 @@ class HarnessOrchestrator:
         task_kind = self.planner.task_kind(
             case.instruction, bool(case.image or case.image_url or case.image_b64)
         )
-        retrieved_memories = self.memory.retrieve_memories(
-            case.instruction, task_type=task_kind, top_k=3
-        )
-        memory_rules = self.memory.format_memories_for_prompt(retrieved_memories)
-        applied_memory_ids = [
-            str(mem.get("memory_id") or mem.get("id"))
-            for mem in retrieved_memories
-            if mem.get("memory_id") or mem.get("id")
-        ]
-        if applied_memory_ids:
-            self.memory.log_usage(
-                applied_memory_ids,
-                episode_id=task_id,
+        with self._memory_lock:
+            retrieved_memories = self.memory.retrieve_memories(
+                case.instruction,
                 task_type=task_kind,
-                question=case.instruction,
-                used_position="planner",
+                top_k=self.config.memory_retrieve_top_k,
             )
-        system_prompt = self.inject_historical_guidelines(SYSTEM_PROMPT, memory_rules)
+            memory_rules = self.memory.format_memories_for_prompt(retrieved_memories)
+            applied_memory_ids = [
+                str(mem.get("memory_id") or mem.get("id"))
+                for mem in retrieved_memories
+                if mem.get("memory_id") or mem.get("id")
+            ]
+            if applied_memory_ids:
+                self.memory.log_usage(
+                    applied_memory_ids,
+                    episode_id=task_id,
+                    task_type=task_kind,
+                    question=case.instruction,
+                    used_position="planner",
+                )
+        strategy_selection = self.case_memory.select_strategies(
+            instruction=case.instruction,
+            task_type=task_kind,
+            top_k=self.config.strategy_memory_top_k,
+        )
+        selected_strategies = list(strategy_selection.get("selected") or [])
+        strategy_rules = self.case_memory.format_strategies_for_prompt(selected_strategies)
+        applied_strategy_ids = [
+            str(item.get("strategy_id"))
+            for item in selected_strategies
+            if item.get("strategy_id")
+        ]
+        prompt_rules = memory_rules + strategy_rules
+        system_prompt = self.inject_historical_guidelines(SYSTEM_PROMPT, prompt_rules)
         traj.write(Role.SYSTEM, system_prompt, step_id=0)
         traj.write(Role.USER, self._build_user_content(case), step_id=0)
         traj.write_event(
@@ -320,6 +503,8 @@ class HarnessOrchestrator:
             {
                 "rules": memory_rules,
                 "memory_ids": applied_memory_ids,
+                "strategy_rules": strategy_rules,
+                "strategy_ids": applied_strategy_ids,
                 "task_kind": task_kind,
                 "retrieved": [
                     {
@@ -329,6 +514,30 @@ class HarnessOrchestrator:
                         "title": mem.get("title"),
                     }
                     for mem in retrieved_memories
+                ],
+                "strategy_selection": {
+                    key: value
+                    for key, value in strategy_selection.items()
+                    if key != "selected"
+                },
+            },
+            step_id=0,
+        )
+        traj.write_event(
+            "strategy_memory_selection",
+            {
+                "strategy_ids": applied_strategy_ids,
+                "source": strategy_selection.get("source"),
+                "reason": strategy_selection.get("reason", ""),
+                "error": strategy_selection.get("error", ""),
+                "selected": [
+                    {
+                        "strategy_id": item.get("strategy_id"),
+                        "strategy_type": item.get("strategy_type"),
+                        "title": item.get("title"),
+                        "trigger": item.get("trigger"),
+                    }
+                    for item in selected_strategies
                 ],
             },
             step_id=0,
@@ -340,10 +549,25 @@ class HarnessOrchestrator:
         api_calls = 0
         total_tokens_accum = 0
         exit_status = "unknown"
+        tool_state = self._new_tool_state()
+        retrieval_records: list[RetrievalRecord] = []
+        answerability_decisions: list[dict[str, Any]] = []
+        candidate_review_attempts = 0
+        clean_retry_messages: list[dict[str, Any]] | None = None
 
         for step in range(1, max_steps + 1):
             steps_done = step
-            messages = traj.to_messages(recent_steps=self.config.context_recent_steps)
+            force_answer_step = step == max_steps
+            if force_answer_step:
+                self._write_force_answer_prompt(traj, step)
+            if clean_retry_messages is not None:
+                messages = clean_retry_messages
+                clean_retry_messages = None
+            else:
+                messages = traj.to_messages(
+                    recent_steps=self.config.context_recent_steps,
+                    include_images=True,
+                )
             if self.config.mock_llm:
                 final_answer = self._mock_answer(case)
                 exit_status = "submitted"
@@ -359,10 +583,15 @@ class HarnessOrchestrator:
                 "model": self.config.model_name,
                 "messages": messages,
                 "max_tokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
-                "extra_body": {"enable_thinking": True},
             }
-            if not self.config.disable_tools:
+            if force_answer_step:
+                request_kwargs["max_tokens"] = min(self.config.max_tokens, 512)
+                request_kwargs["response_format"] = _FINAL_ANSWER_RESPONSE_FORMAT
+            self._apply_main_model_sampling(
+                request_kwargs,
+                enable_thinking=not force_answer_step,
+            )
+            if not self.config.disable_tools and not force_answer_step:
                 request_kwargs["tools"] = self.env.schemas
                 request_kwargs["tool_choice"] = "auto"
 
@@ -389,11 +618,26 @@ class HarnessOrchestrator:
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
             if total_tokens:
                 total_tokens_accum += int(total_tokens)
-            tool_calls = None if self.config.disable_tools else getattr(msg, "tool_calls", None)
+            tool_calls = (
+                None
+                if self.config.disable_tools or force_answer_step
+                else getattr(msg, "tool_calls", None)
+            )
+            pseudo_tool_calls = []
+            if not tool_calls and not self.config.disable_tools and not force_answer_step:
+                pseudo_tool_calls = self._extract_pseudo_tool_calls(content, reasoning_content)
+                if pseudo_tool_calls:
+                    tool_calls = pseudo_tool_calls
 
             extra: dict[str, Any] = {}
             if tool_calls:
-                extra["tool_calls"] = [self._dump_tool_call(tc) for tc in tool_calls]
+                raw_tool_calls = list(tool_calls)
+                extra["tool_calls"] = [self._dump_tool_call(tc) for tc in raw_tool_calls]
+                tool_calls = raw_tool_calls[: max(1, int(self.config.max_tool_calls_per_step))]
+                if len(tool_calls) < len(raw_tool_calls):
+                    extra["tool_calls_truncated_to"] = len(tool_calls)
+            if pseudo_tool_calls:
+                extra["pseudo_tool_call_recovered"] = True
             if reasoning_content:
                 extra["reasoning_content"] = reasoning_content
             if total_tokens:
@@ -401,25 +645,92 @@ class HarnessOrchestrator:
             traj.write(Role.ASSISTANT, content, step_id=step, extra=extra or None)
 
             if not tool_calls:
-                if content:
+                candidate_text = content or reasoning_content
+                issue_type = ""
+                review: dict[str, Any] | None = None
+                if not candidate_text.strip():
+                    issue_type = "no_answer"
+                elif self._extract_pseudo_tool_calls(content, reasoning_content):
+                    failure_reason = self._append_reason(
+                        failure_reason,
+                        "pseudo_tool_call_without_function_call",
+                    )
+                    issue_type = "tool_call_leak"
+                elif self._needs_answer_repair(content):
+                    issue_type = self._answer_issue_type(content)
+
+                if force_answer_step:
                     final_answer = content
-                    exit_status = "submitted"
+                    exit_status = "submitted" if candidate_text.strip() else "empty"
                     break
-                continue
+
+                review = self._handle_case_memory_answer_issue(
+                    case=case,
+                    traj=traj,
+                    task_kind=task_kind,
+                    records=retrieval_records,
+                    bad_answer=candidate_text,
+                    issue_type=issue_type or "none",
+                    step_id=step,
+                    applied_context=prompt_rules,
+                )
+                candidate_review_attempts += 1
+                if review.get("clean_retry_messages"):
+                    clean_retry_messages = list(review.pop("clean_retry_messages") or [])
+                answerability_decisions.append(
+                    {
+                        "step_id": step,
+                        "event": "candidate_answer_review",
+                        "candidate_answer": self._compact_text(candidate_text, 500),
+                        "decision": review,
+                    }
+                )
+                if not bool(review.get("accept")) and not force_answer_step:
+                    continue
+                if not bool(review.get("accept")):
+                    failure_reason = self._append_reason(
+                        failure_reason,
+                        f"candidate_review_rejected:{review.get('issue_type') or issue_type or 'unknown'}",
+                    )
+                    final_answer = ""
+                    exit_status = "candidate_review_rejected"
+                    break
+                final_answer = content
+                exit_status = "submitted"
+                break
 
             blocked = False
             for tc in tool_calls:
                 fn_name, fn_args, tc_id = self._parse_tool_call(tc)
                 try:
-                    gate.inspect_call(fn_name, fn_args)
-                    raw_result = self.env.dispatch(fn_name, fn_args)
-                    error = self.env.result_error(raw_result)
-                    if error:
-                        gate.track_error(fn_name, error)
+                    precheck_error = self._precheck_tool_call(fn_name, fn_args, tool_state)
+                    if precheck_error:
+                        gate.track_error(fn_name, precheck_error)
+                        raw_result = self._tool_guidance_result(
+                            fn_name, precheck_error, fn_args, tool_state
+                        )
+                        error = precheck_error
+                    else:
+                        gate.inspect_call(fn_name, fn_args)
+                        raw_result, error = self._dispatch_tool_with_recovery(
+                            fn_name, fn_args, case, tool_state
+                        )
+                        self._record_tool_outcome(fn_name, fn_args, error, tool_state)
+                        if error:
+                            gate.track_error(fn_name, error)
                     tool_result = self.env.serialize_result(raw_result)
                 except ToolGateBlocked as exc:
                     failure_reason = f"gate_blocked: {exc}"
-                    tool_result = _json_dumps({"ok": False, "error": failure_reason})
+                    tool_result = _json_dumps(
+                        {
+                            "ok": False,
+                            "error": failure_reason,
+                            "harness_guidance": (
+                                "Tool loop or repeated failures were blocked. "
+                                "Stop calling tools and return the best concise final answer from existing observations."
+                            ),
+                        }
+                    )
                     blocked = True
                 except Exception as exc:
                     failure_reason = f"tool_dispatch_failed: {type(exc).__name__}: {exc}"
@@ -433,6 +744,14 @@ class HarnessOrchestrator:
                     tool_call_id=tc_id,
                     extra={"fn_name": fn_name, "fn_args": fn_args},
                 )
+                record = self.case_memory.build_record(
+                    step_id=step,
+                    tool_name=fn_name,
+                    tool_args=fn_args,
+                    raw_result=raw_result,
+                    error=failure_reason if blocked else error,
+                )
+                retrieval_records.append(record)
                 if blocked:
                     exit_status = "gate_blocked"
                     break
@@ -448,37 +767,50 @@ class HarnessOrchestrator:
         elif exit_status == "unknown":
             exit_status = "submitted" if final_answer else "empty"
 
-        applied_rules = list(memory_rules)
+        applied_rules = list(prompt_rules)
         reflection_dict = None
         memory_write = None
+        search_chain_reflection_dict = None
+        search_chain_memory_write = None
+        answer_repair = None
 
-        if self.config.reflection_enabled and self._should_reflection_retry(
-            final_answer, failure_reason, exit_status, case.answer
+        if (
+            self.config.reflection_enabled
+            and steps_done < max_steps
+            and self._should_reflection_retry(final_answer, failure_reason, exit_status)
         ):
+            compiled_reflection: Reflection | None = None
+            compiled_retry_rule = ""
             for retry_no in range(1, self._case_reflection_retry_budget() + 1):
-                reflection = self.compiler.compile_failed_trace(
-                    traj.read_all(), case.instruction
-                )
+                if compiled_reflection is None:
+                    compiled_reflection = self.compiler.compile_failed_trace(
+                        traj.read_all(), case.instruction
+                    )
+                    compiled_retry_rule = compiled_reflection.clin_rule
+                reflection = compiled_reflection
                 reflection_dict = reflection.as_dict()
                 reflection_dict["retry_attempt"] = retry_no
                 traj.write_event("reflection", reflection_dict, step_id=steps_done)
 
-                retry_rule = reflection.clin_rule
-                if reflection.memory_worthy:
-                    memory_write = self.memory.auto_dream_deduplication(
-                        retry_rule,
-                        self._memory_keywords(case, reflection),
-                        advisor=self.compiler.advise_memory_update
-                        if self.config.memory_model_enabled
-                        else None,
-                        task_instruction=case.instruction,
-                        task_type=task_kind,
-                        episode_id=task_id,
-                    )
+                retry_rule = compiled_retry_rule or reflection.clin_rule
+                if retry_no == 1 and reflection.memory_worthy:
+                    with self._memory_lock:
+                        memory_write = self.memory.auto_dream_deduplication(
+                            retry_rule,
+                            self._memory_keywords(case, reflection),
+                            advisor=self.compiler.advise_memory_update
+                            if self.config.memory_model_enabled
+                            else None,
+                            task_instruction=case.instruction,
+                            task_type=task_kind,
+                            episode_id=task_id,
+                        )
                     retry_rule = str(memory_write.get("rule") or retry_rule)
                     traj.write_event("memory_write", memory_write, step_id=steps_done)
                     if memory_write.get("memory_id"):
                         applied_memory_ids.append(str(memory_write["memory_id"]))
+                    compiled_retry_rule = str(memory_write.get("rule") or retry_rule)
+                    retry_rule = compiled_retry_rule
                 if retry_rule:
                     applied_rules.append(retry_rule)
 
@@ -486,6 +818,7 @@ class HarnessOrchestrator:
                     case=case,
                     traj=traj,
                     reflection=reflection,
+                    retry_rule=retry_rule,
                     start_step=steps_done,
                     retry_no=retry_no,
                 )
@@ -502,20 +835,158 @@ class HarnessOrchestrator:
                 if self._has_parseable_prediction(final_answer):
                     break
 
-        success = self._judge_success(final_answer, case.answer)
-        if applied_memory_ids:
-            self.memory.update_after_episode(
-                applied_memory_ids,
-                episode_id=task_id,
-                outcome="success" if success else "failure",
-                judged_helpful=success,
-                comment="Automatically updated from harness episode outcome.",
+        final_step_limit = max_steps + max(0, int(self.config.final_answer_max_attempts))
+        repair_attempts = min(
+            max(0, int(self.config.answer_repair_attempts)),
+            max(0, final_step_limit - steps_done),
+        )
+        if repair_attempts and self._needs_answer_repair(final_answer):
+            repair_history: list[dict[str, Any]] = []
+            for repair_no in range(1, repair_attempts + 1):
+                answer_repair = self._run_short_answer_repair(
+                    case=case,
+                    traj=traj,
+                    previous_answer=final_answer,
+                    start_step=steps_done,
+                    repair_no=repair_no,
+                )
+                repair_history.append(answer_repair)
+                steps_done = int(answer_repair["steps_done"])
+                api_calls += int(answer_repair["api_calls"])
+                total_tokens_accum += int(answer_repair["total_tokens"])
+                repaired_answer = str(answer_repair.get("answer") or "")
+                if repaired_answer:
+                    final_answer = repaired_answer
+                if self._has_parseable_prediction(final_answer):
+                    exit_status = "answer_repaired"
+                    break
+            if repair_history:
+                answer_repair = {
+                    "attempts": len(repair_history),
+                    "last": repair_history[-1],
+                    "history": repair_history,
+                }
+            if not self._has_parseable_prediction(final_answer):
+                failure_reason = self._append_reason(
+                    failure_reason,
+                    str(
+                        (repair_history[-1].get("failure_reason") if repair_history else "")
+                        or "answer_repair_unresolved"
+                    ),
+                )
+
+        forced_answer = None
+        remaining_final_attempts = max(0, final_step_limit - steps_done)
+        if (
+            self.config.forced_answer_enabled
+            and remaining_final_attempts > 0
+            and steps_done >= max_steps
+            and self._needs_answer_repair(final_answer)
+        ):
+            forced_answer = self._run_forced_evidence_answer(
+                case=case,
+                traj=traj,
+                previous_answer=final_answer,
+                start_step=steps_done,
+                failure_reason=failure_reason,
+                max_attempts=remaining_final_attempts,
             )
+            steps_done = int(forced_answer["steps_done"])
+            api_calls += int(forced_answer["api_calls"])
+            total_tokens_accum += int(forced_answer["total_tokens"])
+            if forced_answer.get("answer"):
+                final_answer = str(forced_answer["answer"])
+            if self._has_parseable_prediction(final_answer):
+                exit_status = "forced_answer_submitted"
+                failure_reason = self._append_reason(failure_reason, "forced_answer_used")
+            else:
+                failure_reason = self._append_reason(
+                    failure_reason,
+                    str(forced_answer.get("failure_reason") or "forced_answer_unresolved"),
+                )
+
+        pred_text = self._extract_model_pred(final_answer)
+        has_pred = bool(pred_text)
+        eval_status = self._eval_status(final_answer, "")
+        success = eval_status == "correct"
+        case_memory_persist = self.case_memory.persist_case(
+            task_id=task_id,
+            task_type=task_kind,
+            instruction=case.instruction,
+            records=retrieval_records,
+            decisions=answerability_decisions,
+            pred=pred_text,
+            eval_status=eval_status,
+            exit_status=exit_status,
+            failure_reason=failure_reason,
+        )
+        if case_memory_persist.get("written"):
+            traj.write_event("case_memory_persist", case_memory_persist, step_id=steps_done)
+
+        strategy_memory_write = self.case_memory.maybe_write_strategy(
+            task_id=task_id,
+            instruction=case.instruction,
+            task_type=task_kind,
+            records=retrieval_records,
+            decisions=answerability_decisions,
+            pred=pred_text,
+            eval_status=eval_status,
+            exit_status=exit_status,
+            failure_reason=failure_reason,
+        )
+        if strategy_memory_write.get("operation") != "IGNORE":
+            traj.write_event("strategy_memory_write", strategy_memory_write, step_id=steps_done)
+        memory_outcome = self._memory_outcome(eval_status, has_pred)
+        if applied_memory_ids and memory_outcome:
+            with self._memory_lock:
+                self.memory.update_after_episode(
+                    applied_memory_ids,
+                    episode_id=task_id,
+                    outcome=memory_outcome,
+                    judged_helpful=success,
+                    comment="Automatically updated from harness episode outcome.",
+                )
+
+        if (
+            has_pred
+            and self.config.reflection_enabled
+            and self.config.search_chain_reflection_enabled
+        ):
+            search_chain_reflection = self.compiler.compile_search_chain_lesson(
+                traj.read_all(), case.instruction, pred_text
+            )
+            if search_chain_reflection is not None:
+                search_chain_reflection_dict = search_chain_reflection.as_dict()
+                traj.write_event(
+                    "search_chain_reflection",
+                    search_chain_reflection_dict,
+                    step_id=steps_done,
+                )
+                if search_chain_reflection.memory_worthy and search_chain_reflection.clin_rule:
+                    with self._memory_lock:
+                        search_chain_memory_write = self.memory.auto_dream_deduplication(
+                            search_chain_reflection.clin_rule,
+                            self._memory_keywords(case, search_chain_reflection)
+                            + ["search_chain", "query_template", "keyword_promotion"],
+                            advisor=self.compiler.advise_memory_update
+                            if self.config.memory_model_enabled
+                            else None,
+                            task_instruction=case.instruction,
+                            memory_type="query_strategy",
+                            task_type=task_kind,
+                            episode_id=task_id,
+                            extra_fields=search_chain_reflection.metadata,
+                        )
+                    traj.write_event(
+                        "search_chain_memory_write",
+                        search_chain_memory_write,
+                        step_id=steps_done,
+                    )
 
         if (
             reflection_dict is None
             and self.config.reflection_enabled
-            and (failure_reason or (case.answer and not success))
+            and failure_reason
         ):
             reflection = self.compiler.compile_failed_trace(
                 traj.read_all(), case.instruction
@@ -523,16 +994,17 @@ class HarnessOrchestrator:
             reflection_dict = reflection.as_dict()
             traj.write_event("reflection", reflection_dict, step_id=steps_done)
             if reflection.memory_worthy:
-                memory_write = self.memory.auto_dream_deduplication(
-                    reflection.clin_rule,
-                    self._memory_keywords(case, reflection),
-                    advisor=self.compiler.advise_memory_update
-                    if self.config.memory_model_enabled
-                    else None,
-                    task_instruction=case.instruction,
-                    task_type=task_kind,
-                    episode_id=task_id,
-                )
+                with self._memory_lock:
+                    memory_write = self.memory.auto_dream_deduplication(
+                        reflection.clin_rule,
+                        self._memory_keywords(case, reflection),
+                        advisor=self.compiler.advise_memory_update
+                        if self.config.memory_model_enabled
+                        else None,
+                        task_instruction=case.instruction,
+                        task_type=task_kind,
+                        episode_id=task_id,
+                    )
                 traj.write_event("memory_write", memory_write, step_id=steps_done)
 
         traj.write_event(
@@ -540,9 +1012,18 @@ class HarnessOrchestrator:
             {
                 "exit_status": exit_status,
                 "success": success,
+                "has_pred": has_pred,
+                "eval_status": eval_status,
                 "failure_reason": failure_reason,
                 "api_calls": api_calls,
                 "total_tokens": total_tokens_accum,
+                "answer_repair": answer_repair,
+                "forced_answer": forced_answer,
+                "search_chain_reflection": search_chain_reflection_dict,
+                "search_chain_memory_write": search_chain_memory_write,
+                "case_memory_records": len(retrieval_records),
+                "case_memory_persist": case_memory_persist,
+                "strategy_memory_write": strategy_memory_write,
             },
             step_id=steps_done,
         )
@@ -550,28 +1031,37 @@ class HarnessOrchestrator:
         return {
             "task_id": task_id,
             "answer": final_answer,
-            "pred": self._extract_model_pred(final_answer),
+            "pred": pred_text,
             "steps": steps_done,
             "trajectory_path": str(traj.path),
             "summary": traj.summary(),
             "success": success,
+            "has_pred": has_pred,
+            "eval_status": eval_status,
             "failure_reason": failure_reason,
             "exit_status": exit_status,
             "api_calls": api_calls,
             "total_tokens": total_tokens_accum,
             "reflection": reflection_dict,
             "memory_write": memory_write,
+            "search_chain_reflection": search_chain_reflection_dict,
+            "search_chain_memory_write": search_chain_memory_write,
+            "case_memory_persist": case_memory_persist,
+            "strategy_memory_write": strategy_memory_write,
+            "answer_repair": answer_repair,
+            "forced_answer": forced_answer,
             "applied_rules": applied_rules,
             "applied_memory_ids": applied_memory_ids,
+            "applied_strategy_ids": applied_strategy_ids,
         }
 
     def _should_reflection_retry(
-        self, final_answer: str, failure_reason: str, exit_status: str, gold_answer: str = ""
+        self, final_answer: str, failure_reason: str, exit_status: str
     ) -> bool:
         if self._case_reflection_retry_budget() <= 0:
             return False
-        if gold_answer and self._has_parseable_prediction(final_answer):
-            return not self._judge_success(final_answer, gold_answer)
+        if self._is_explanatory_or_long_prediction(final_answer) and not self._is_non_answer_prediction(final_answer):
+            return False
         if self._has_parseable_prediction(final_answer) and not failure_reason:
             return False
         if exit_status in {"submitted", "self_reflection_submitted"} and self._has_parseable_prediction(final_answer):
@@ -588,6 +1078,7 @@ class HarnessOrchestrator:
         case: TaskCase,
         traj: Trajectory,
         reflection: Reflection,
+        retry_rule: str,
         start_step: int,
         retry_no: int,
     ) -> dict[str, Any]:
@@ -598,20 +1089,22 @@ class HarnessOrchestrator:
             similarity_threshold=self.config.gate_similarity_threshold,
             critical_limit=self.config.gate_critical_limit,
         )
-        retry_prompt = (
-            "[SELF_REFLECTION_RETRY]\n"
-            f"Attempt {retry_no} is a recovery attempt for the same task.\n"
-            f"Failure type: {reflection.failure_type}\n"
-            f"Root cause: {reflection.root_cause}\n"
-            f"Temporary guideline: {reflection.clin_rule}\n"
-            "Use the guideline as a skeptical hint. Avoid repeating blocked or unhelpful tool calls. "
-            "If enough evidence is already available, answer immediately. "
-            "Return exactly one concise final response wrapped as <answer>...</answer>."
+        retry_prompt = build_self_reflection_retry_prompt(
+            retry_no=retry_no,
+            failure_type=reflection.failure_type,
+            root_cause=reflection.root_cause,
+            retry_rule=retry_rule or reflection.clin_rule,
         )
+        allow_tools = retry_no == 1
         user_step = start_step + 1
         traj.write_event(
             "self_reflection_retry_start",
-            {"retry_attempt": retry_no, "max_steps": max_steps, "clin_rule": reflection.clin_rule},
+            {
+                "retry_attempt": retry_no,
+                "max_steps": max_steps,
+                "tools_enabled": allow_tools and not self.config.disable_tools,
+                "clin_rule": retry_rule or reflection.clin_rule,
+            },
             step_id=start_step,
         )
         traj.write(Role.USER, retry_prompt, step_id=user_step)
@@ -622,10 +1115,14 @@ class HarnessOrchestrator:
         api_calls = 0
         total_tokens_accum = 0
         steps_done = user_step
+        tool_state = self._new_tool_state()
 
         for offset in range(1, max_steps + 1):
             step_id = user_step + offset
             steps_done = step_id
+            force_answer_step = offset == max_steps
+            if force_answer_step:
+                self._write_force_answer_prompt(traj, step_id)
             if self.config.mock_llm:
                 final_answer = self._mock_answer(case)
                 exit_status = "self_reflection_submitted"
@@ -639,12 +1136,20 @@ class HarnessOrchestrator:
 
             request_kwargs = {
                 "model": self.config.model_name,
-                "messages": traj.to_messages(recent_steps=self.config.context_recent_steps),
+                "messages": traj.to_messages(
+                    recent_steps=self.config.context_recent_steps,
+                    include_images=True,
+                ),
                 "max_tokens": self.config.max_tokens,
-                "temperature": max(0.2, min(self.config.temperature, 0.8)),
-                "extra_body": {"enable_thinking": True},
             }
-            if not self.config.disable_tools:
+            if force_answer_step:
+                request_kwargs["max_tokens"] = min(self.config.max_tokens, 512)
+                request_kwargs["response_format"] = _FINAL_ANSWER_RESPONSE_FORMAT
+            self._apply_main_model_sampling(
+                request_kwargs,
+                enable_thinking=not force_answer_step,
+            )
+            if not self.config.disable_tools and allow_tools and not force_answer_step:
                 request_kwargs["tools"] = self.env.schemas
                 request_kwargs["tool_choice"] = "auto"
 
@@ -673,11 +1178,26 @@ class HarnessOrchestrator:
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
             if total_tokens:
                 total_tokens_accum += int(total_tokens)
-            tool_calls = None if self.config.disable_tools else getattr(msg, "tool_calls", None)
+            tool_calls = (
+                None
+                if self.config.disable_tools or not allow_tools
+                else getattr(msg, "tool_calls", None)
+            )
+            pseudo_tool_calls = []
+            if not tool_calls and not self.config.disable_tools and allow_tools:
+                pseudo_tool_calls = self._extract_pseudo_tool_calls(content, reasoning_content)
+                if pseudo_tool_calls:
+                    tool_calls = pseudo_tool_calls
 
             extra: dict[str, Any] = {}
             if tool_calls:
-                extra["tool_calls"] = [self._dump_tool_call(tc) for tc in tool_calls]
+                raw_tool_calls = list(tool_calls)
+                extra["tool_calls"] = [self._dump_tool_call(tc) for tc in raw_tool_calls]
+                tool_calls = raw_tool_calls[: max(1, int(self.config.max_tool_calls_per_step))]
+                if len(tool_calls) < len(raw_tool_calls):
+                    extra["tool_calls_truncated_to"] = len(tool_calls)
+            if pseudo_tool_calls:
+                extra["pseudo_tool_call_recovered"] = True
             if reasoning_content:
                 extra["reasoning_content"] = reasoning_content
             if total_tokens:
@@ -686,6 +1206,12 @@ class HarnessOrchestrator:
 
             if not tool_calls:
                 if content:
+                    if self._extract_pseudo_tool_calls(content, reasoning_content):
+                        failure_reason = self._append_reason(
+                            failure_reason,
+                            "self_reflection_pseudo_tool_call_without_function_call",
+                        )
+                        continue
                     final_answer = content
                     exit_status = "self_reflection_submitted"
                     break
@@ -695,15 +1221,34 @@ class HarnessOrchestrator:
             for tc in tool_calls:
                 fn_name, fn_args, tc_id = self._parse_tool_call(tc)
                 try:
-                    gate.inspect_call(fn_name, fn_args)
-                    raw_result = self.env.dispatch(fn_name, fn_args)
-                    error = self.env.result_error(raw_result)
-                    if error:
-                        gate.track_error(fn_name, error)
+                    precheck_error = self._precheck_tool_call(fn_name, fn_args, tool_state)
+                    if precheck_error:
+                        gate.track_error(fn_name, precheck_error)
+                        raw_result = self._tool_guidance_result(
+                            fn_name, precheck_error, fn_args, tool_state
+                        )
+                        error = precheck_error
+                    else:
+                        gate.inspect_call(fn_name, fn_args)
+                        raw_result, error = self._dispatch_tool_with_recovery(
+                            fn_name, fn_args, case, tool_state
+                        )
+                        self._record_tool_outcome(fn_name, fn_args, error, tool_state)
+                        if error:
+                            gate.track_error(fn_name, error)
                     tool_result = self.env.serialize_result(raw_result)
                 except ToolGateBlocked as exc:
                     failure_reason = f"self_reflection_gate_blocked: {exc}"
-                    tool_result = _json_dumps({"ok": False, "error": failure_reason})
+                    tool_result = _json_dumps(
+                        {
+                            "ok": False,
+                            "error": failure_reason,
+                            "harness_guidance": (
+                                "Tool loop or repeated failures were blocked. "
+                                "Stop calling tools and return the best concise final answer from existing observations."
+                            ),
+                        }
+                    )
                     blocked = True
                 except Exception as exc:
                     failure_reason = f"self_reflection_tool_failed: {type(exc).__name__}: {exc}"
@@ -748,12 +1293,445 @@ class HarnessOrchestrator:
             "total_tokens": total_tokens_accum,
         }
 
+    def _run_short_answer_repair(
+        self,
+        case: TaskCase,
+        traj: Trajectory,
+        previous_answer: str,
+        start_step: int,
+        repair_no: int = 1,
+    ) -> dict[str, Any]:
+        """Append one no-tool turn to convert empty/refusal/verbose output into a short answer."""
+        user_step = start_step + 1
+        assistant_step = user_step
+        traj.write_event(
+            "answer_repair_start",
+            {
+                "repair_attempt": repair_no,
+                "reason": self._answer_repair_reason(previous_answer),
+                "previous_pred": self.extract_pred(previous_answer)[:500],
+            },
+            step_id=start_step,
+        )
+        traj.write(
+            Role.USER,
+            SHORT_ANSWER_REPAIR_PROMPT,
+            step_id=user_step,
+        )
+
+        if self.config.mock_llm:
+            final_answer = self._mock_answer(case)
+            traj.write(
+                Role.ASSISTANT,
+                final_answer,
+                step_id=assistant_step,
+                extra={"reasoning_content": "MOCK_LLM short-answer repair path."},
+            )
+            status = "answer_repaired" if self._has_parseable_prediction(final_answer) else "answer_repair_unresolved"
+            traj.write_event(
+                "answer_repair_status",
+                {
+                    "repair_attempt": repair_no,
+                    "exit_status": status,
+                    "pred": self._extract_model_pred(final_answer),
+                    "api_calls": 0,
+                    "total_tokens": 0,
+                },
+                step_id=assistant_step,
+            )
+            return {
+                "answer": final_answer,
+                "steps_done": assistant_step,
+                "failure_reason": "" if status == "answer_repaired" else "answer_repair_unresolved",
+                "api_calls": 0,
+                "total_tokens": 0,
+                "repair_attempt": repair_no,
+            }
+
+        request_kwargs = {
+            "model": self.config.model_name,
+            "messages": traj.to_messages(
+                recent_steps=max(self.config.context_recent_steps, 8),
+                include_images=True,
+            ),
+            "max_tokens": min(self.config.max_tokens, 512),
+            "response_format": _FINAL_ANSWER_RESPONSE_FORMAT,
+        }
+        self._apply_main_model_sampling(request_kwargs, enable_thinking=False)
+        api_calls = 0
+        total_tokens_accum = 0
+        final_answer = ""
+        failure_reason = ""
+        try:
+            if self.client is None:
+                raise RuntimeError("OpenAI client is unavailable")
+            response, attempts = self._call_llm_with_retry(request_kwargs)
+            api_calls += attempts
+            msg = response.choices[0].message
+            final_answer = getattr(msg, "content", None) or ""
+            reasoning_content = getattr(msg, "reasoning_content", None) or ""
+            usage = getattr(response, "usage", None)
+            total_tokens = getattr(usage, "total_tokens", None) if usage else None
+            if total_tokens:
+                total_tokens_accum += int(total_tokens)
+            extra: dict[str, Any] = {}
+            if reasoning_content:
+                extra["reasoning_content"] = reasoning_content
+            if total_tokens:
+                extra["total_tokens"] = total_tokens
+            traj.write(Role.ASSISTANT, final_answer, step_id=assistant_step, extra=extra or None)
+        except LLMCallFailure as exc:
+            api_calls += exc.attempts
+            failure_reason = f"answer_repair_llm_failed: {type(exc).__name__}: {exc}"
+            traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=assistant_step)
+        except Exception as exc:
+            failure_reason = f"answer_repair_llm_failed: {type(exc).__name__}: {exc}"
+            traj.write(Role.TOOL, f"[HARNESS ERROR] {failure_reason}", step_id=assistant_step)
+
+        if final_answer and self._needs_answer_repair(final_answer):
+            failure_reason = self._append_reason(failure_reason, "answer_repair_unresolved")
+        status = "answer_repaired" if final_answer and not self._needs_answer_repair(final_answer) else "answer_repair_unresolved"
+        traj.write_event(
+            "answer_repair_status",
+            {
+                "repair_attempt": repair_no,
+                "exit_status": status,
+                "pred": self._extract_model_pred(final_answer),
+                "failure_reason": failure_reason,
+                "api_calls": api_calls,
+                "total_tokens": total_tokens_accum,
+            },
+            step_id=assistant_step,
+        )
+        return {
+            "answer": final_answer,
+            "steps_done": assistant_step,
+            "failure_reason": failure_reason,
+            "api_calls": api_calls,
+            "total_tokens": total_tokens_accum,
+            "repair_attempt": repair_no,
+        }
+
+    def _run_forced_evidence_answer(
+        self,
+        case: TaskCase,
+        traj: Trajectory,
+        previous_answer: str,
+        start_step: int,
+        failure_reason: str,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
+        """Last-resort no-tool answer extraction from task text, search observations, and prior reasoning."""
+        user_step = start_step + 1
+        evidence = self._build_forced_answer_evidence(traj)
+        max_attempts = max(0, int(max_attempts if max_attempts is not None else self.config.final_answer_max_attempts))
+        traj.write_event(
+            "forced_answer_start",
+            {
+                "reason": self._answer_repair_reason(previous_answer),
+                "previous_pred": self.extract_pred(previous_answer)[:500],
+                "failure_reason": failure_reason[:500],
+                "evidence_chars": len(evidence),
+                "max_attempts": max_attempts,
+            },
+            step_id=start_step,
+        )
+        traj.write(
+            Role.USER,
+            build_forced_evidence_answer_prompt(
+                task=case.instruction,
+                failure_reason=failure_reason,
+                evidence=evidence,
+            ),
+            step_id=user_step,
+        )
+
+        if max_attempts <= 0:
+            forced_failure = self._append_reason(failure_reason, "forced_answer_budget_exhausted")
+            traj.write_event(
+                "forced_answer_status",
+                {
+                    "exit_status": "forced_answer_unresolved",
+                    "pred": "",
+                    "failure_reason": forced_failure,
+                    "api_calls": 0,
+                    "total_tokens": 0,
+                    "attempts": 0,
+                    "max_attempts": 0,
+                },
+                step_id=start_step,
+            )
+            return {
+                "answer": "",
+                "steps_done": start_step,
+                "failure_reason": forced_failure,
+                "api_calls": 0,
+                "total_tokens": 0,
+                "attempts": 0,
+                "max_attempts": 0,
+            }
+
+        if self.config.mock_llm:
+            final_answer = self._mock_answer(case)
+            status = "forced_answer_submitted" if self._has_parseable_prediction(final_answer) else "forced_answer_unresolved"
+            assistant_step = user_step + 1
+            traj.write(
+                Role.ASSISTANT,
+                final_answer,
+                step_id=assistant_step,
+                extra={"reasoning_content": "MOCK_LLM forced-answer path."},
+            )
+            traj.write_event(
+                "forced_answer_status",
+                {"exit_status": status, "pred": self._extract_model_pred(final_answer), "api_calls": 0, "total_tokens": 0},
+                step_id=assistant_step,
+            )
+            return {
+                "answer": final_answer,
+                "steps_done": assistant_step,
+                "failure_reason": "" if status == "forced_answer_submitted" else "forced_answer_unresolved",
+                "api_calls": 0,
+                "total_tokens": 0,
+            }
+
+        api_calls = 0
+        total_tokens_accum = 0
+        final_answer = ""
+        forced_failure = ""
+        steps_done = user_step
+        attempts_done = 0
+        for attempt_no in range(1, max_attempts + 1):
+            assistant_step = start_step + attempt_no
+            attempts_done = attempt_no
+            request_kwargs = {
+                "model": self.config.model_name,
+                "messages": traj.to_messages(
+                    recent_steps=max(self.config.context_recent_steps, 10),
+                    include_images=True,
+                ),
+                "max_tokens": min(self.config.max_tokens, 512),
+                "response_format": _FINAL_ANSWER_RESPONSE_FORMAT,
+            }
+            self._apply_main_model_sampling(request_kwargs, enable_thinking=False)
+            try:
+                if self.client is None:
+                    raise RuntimeError("OpenAI client is unavailable")
+                response, attempts = self._call_llm_with_retry(request_kwargs)
+                api_calls += attempts
+                msg = response.choices[0].message
+                final_answer = getattr(msg, "content", None) or ""
+                reasoning_content = getattr(msg, "reasoning_content", None) or ""
+                usage = getattr(response, "usage", None)
+                total_tokens = getattr(usage, "total_tokens", None) if usage else None
+                if total_tokens:
+                    total_tokens_accum += int(total_tokens)
+                extra: dict[str, Any] = {"forced_answer_attempt": attempt_no}
+                if reasoning_content:
+                    extra["reasoning_content"] = reasoning_content
+                if total_tokens:
+                    extra["total_tokens"] = total_tokens
+                traj.write(Role.ASSISTANT, final_answer, step_id=assistant_step, extra=extra)
+                steps_done = assistant_step
+            except LLMCallFailure as exc:
+                api_calls += exc.attempts
+                forced_failure = f"forced_answer_llm_failed: {type(exc).__name__}: {exc}"
+                traj.write(Role.TOOL, f"[HARNESS ERROR] {forced_failure}", step_id=assistant_step)
+                steps_done = assistant_step
+                break
+            except Exception as exc:
+                forced_failure = f"forced_answer_llm_failed: {type(exc).__name__}: {exc}"
+                traj.write(Role.TOOL, f"[HARNESS ERROR] {forced_failure}", step_id=assistant_step)
+                steps_done = assistant_step
+                break
+
+            if self._has_parseable_prediction(final_answer):
+                break
+            if attempt_no < max_attempts:
+                traj.write(
+                    Role.USER,
+                    (
+                        "[HARNESS_FORCE_ANSWER_RETRY]\n"
+                        f"第 {attempt_no} 次最终作答仍不可提交。不要调用工具。"
+                        "你必须输出一个非空、可提交、最短的最终答案字段。"
+                        "如果证据不完整，也要从已有观察中选择最具体、最可能的候选答案。"
+                        "不要输出 unknown、Unknown、unable、cannot、insufficient、not enough information、无法确定、信息不足、证据不足、工具失败、解释、Markdown 或证据。"
+                        "只返回 JSON: {\"final_answer\":\"答案\"}。"
+                    ),
+                    step_id=assistant_step,
+                )
+                steps_done = assistant_step
+
+        status = "forced_answer_submitted" if self._has_parseable_prediction(final_answer) else "forced_answer_unresolved"
+        if status != "forced_answer_submitted":
+            forced_failure = self._append_reason(forced_failure, "forced_answer_unresolved")
+        traj.write_event(
+            "forced_answer_status",
+            {
+                "exit_status": status,
+                "pred": self._extract_model_pred(final_answer),
+                "failure_reason": forced_failure,
+                "api_calls": api_calls,
+                "total_tokens": total_tokens_accum,
+                "attempts": attempts_done,
+                "max_attempts": max_attempts,
+            },
+            step_id=steps_done,
+        )
+        return {
+            "answer": final_answer,
+            "steps_done": steps_done,
+            "failure_reason": forced_failure,
+            "api_calls": api_calls,
+            "total_tokens": total_tokens_accum,
+            "attempts": attempts_done,
+            "max_attempts": max_attempts,
+        }
+
+    def _build_forced_answer_evidence(self, traj: Trajectory) -> str:
+        max_chars = max(1000, int(self.config.forced_answer_evidence_chars))
+        snippets: list[str] = []
+        rows = traj.read_all()
+        for row in rows:
+            role = row.get("role")
+            content = row.get("content")
+            if row.get("event_type") in {"reflection", "memory_retrieval"}:
+                if self.config.forced_answer_use_reflection:
+                    snippets.append(f"[{row.get('event_type')}] {self._compact_text(content, 700)}")
+            elif role == "tool":
+                snippets.append(f"[tool:{row.get('fn_name') or 'unknown'}] {self._compact_text(content, 1400)}")
+            elif role == "assistant":
+                answer_text = self.extract_pred(str(content or ""))
+                reasoning = str(row.get("reasoning_content") or "")
+                if answer_text and not self._needs_answer_repair(f"<answer>{answer_text}</answer>"):
+                    snippets.append(f"[assistant_answer_candidate] {self._compact_text(answer_text, 300)}")
+                if reasoning:
+                    snippets.append(f"[assistant_reasoning] {self._compact_text(reasoning, 1100)}")
+        joined = "\n".join(snippets)
+        if len(joined) <= max_chars:
+            return joined
+        return joined[-max_chars:]
+
+    def _compact_text(self, value: Any, max_chars: int) -> str:
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[:max_chars]
+
+    def _heuristic_forced_answer(self, evidence: str, instruction: str) -> str:
+        candidates: list[str] = []
+        for match in re.finditer(r"<answer>(.*?)</answer>", evidence, flags=re.S | re.I):
+            candidates.append(match.group(1))
+        for line in evidence.splitlines():
+            if "[assistant_answer_candidate]" in line:
+                candidates.append(line.split("]", 1)[-1])
+        for prefix in (
+            r"(?:answer is|answer:|candidate is|likely answer is|provide:)\s*([A-Z][A-Za-z0-9&'().,\- ]{2,80})",
+            r"(?:答案是|候选答案是|最可能是)\s*([\u4e00-\u9fffA-Za-z0-9&'().,\- ]{2,80})",
+        ):
+            for match in re.finditer(prefix, evidence, flags=re.I):
+                candidates.append(match.group(1))
+        for quoted in re.findall(r"[\"“]([^\"”]{3,80})[\"”]", evidence):
+            candidates.append(quoted)
+        title_like = re.findall(
+            r"\b([A-Z][A-Za-z0-9'&.-]+(?:\s+[A-Z][A-Za-z0-9'&.-]+){1,8})\b",
+            evidence,
+        )
+        candidates.extend(title_like)
+
+        task_terms = set(re.findall(r"[a-z0-9]+", instruction.lower()))
+        best = ""
+        best_score = -1
+        for candidate in candidates:
+            cleaned = self._clean_forced_candidate(candidate)
+            if not cleaned:
+                continue
+            if self._needs_answer_repair(f"<answer>{cleaned}</answer>"):
+                continue
+            words = re.findall(r"[a-z0-9]+", cleaned.lower())
+            generic_penalty = sum(1 for word in words if word in task_terms)
+            score = len(cleaned) - generic_penalty * 8
+            if re.search(r"\d", cleaned):
+                score += 5
+            if 2 <= len(words) <= 8:
+                score += 5
+            if score > best_score:
+                best = cleaned
+                best_score = score
+        return best
+
+    def _clean_forced_candidate(self, candidate: str) -> str:
+        candidate = re.sub(r"<.*?>", " ", str(candidate or ""))
+        candidate = re.sub(r"\s+", " ", candidate).strip(" \t\r\n\"'`.,;:!?")
+        candidate = re.sub(r"^\s*(the answer is|answer is|answer:|candidate is)\s+", "", candidate, flags=re.I)
+        candidate = candidate.strip(" \t\r\n\"'`.,;:!?")
+        if not candidate or len(candidate) > 120:
+            return ""
+        generic_phrases = (
+            "after evidence is sufficient",
+            "emit exactly one short answer",
+            "wrap the answer",
+            "strict answer tag",
+            "answer repaired",
+            "forced answer",
+            "tool budget",
+            "search budget",
+            "not enough information",
+            "unable to",
+            "cannot",
+            "insufficient",
+            "unknown",
+            "determine",
+            "the run ended",
+            "the agent repeated",
+            "action:",
+            "confidence:",
+            "correct_strategy",
+            "failure_type",
+            "root_cause",
+            "memory_worthy",
+            "clin_rule",
+            "missing_strict_answer",
+            "incomplete_reasoning_chain",
+            "retry_attempt",
+            "memory_retrieval",
+            "reflection",
+            "episode",
+            "task_kind",
+            "open_search",
+            "visual",
+            "perform structured",
+            "multi-hop validation",
+            "subject validation",
+            "candidate validation",
+            "validation checks",
+            "least-wrong concrete candidate",
+            "rules",
+            "memory_ids",
+            "retrieved",
+        )
+        low = candidate.lower()
+        if any(phrase in low for phrase in generic_phrases):
+            return ""
+        if re.fullmatch(r"[a-z_]{3,40}", candidate) and "_" in candidate:
+            return ""
+        if re.fullmatch(
+            r"(confidence|should|may|true|false|success|failure|empty|submitted|none|null|open_search|retrieved)",
+            low,
+        ):
+            return ""
+        if re.search(r"\[(?:team name|answer|unknown|placeholder)\]", candidate, flags=re.I):
+            return ""
+        return candidate
+
     def _build_user_content(self, case: TaskCase) -> Any:
         instruction = case.instruction
         if case.image_url:
             instruction = f"{instruction}\nimage_url: {case.image_url}"
         if case.image:
-            instruction = f"{instruction}\nlocal_image_path_for_tools: {case.image}"
+            instruction = (
+                f"{instruction}\nlocal_image_path_for_vision: {case.image}"
+                f"\nlocal_image_path_for_search: {case.image}"
+            )
 
         if case.image_b64:
             _, mime = _detect_image_suffix(case.image_b64)
@@ -761,12 +1739,114 @@ class HarnessOrchestrator:
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{case.image_b64}"}},
                 {"type": "text", "text": instruction},
             ]
+        if case.image:
+            image_b64 = self._read_local_image_b64(case.image)
+            if image_b64:
+                _, mime = _detect_image_suffix(image_b64)
+                return [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+                    {"type": "text", "text": instruction},
+                ]
         if case.image_url:
             return [
                 {"type": "image_url", "image_url": {"url": case.image_url}},
                 {"type": "text", "text": instruction},
             ]
         return instruction
+
+    def _build_clean_answer_issue_retry_messages(
+        self,
+        *,
+        case: TaskCase,
+        system_prompt: str,
+        records: list[RetrievalRecord],
+        retry_context: str,
+        issue_type: str,
+        candidate_answer: str,
+    ) -> list[dict[str, Any]]:
+        observations = self.case_memory.format_records_for_retry_prompt(records)
+        retry_text = (
+            "[CASE_MEMORY_CLEAN_RETRY]\n"
+            "上一轮候选输出存在格式、拒答、空答案或不可提交问题；下面重新给出当前题目和已压缩的检索观察。\n"
+            "不要使用上一轮失败输出的思维链、坏格式或重复工具调用历史；只基于本条消息中的题目、图片和观察继续。\n"
+            f"问题信号：{issue_type or 'answer_issue'}。\n"
+            f"上一轮候选预览：{self._compact_text(candidate_answer, 300) or '空'}。\n"
+            "32B 压缩的无答案观察上下文：\n"
+            f"{retry_context or '当前没有可复用的检索观察记录。'}\n\n"
+            "压缩后的检索观察：\n"
+            f"{observations}\n\n"
+            "如果已有任何能回答题目字段的候选答案，本轮不要再调用工具，直接输出最短答案字段。"
+            "如果继续检索，避免重复同一个搜索 query、重复访问同一个 URL，也不要连续改写同一语义方向的近义 query。"
+            "若同一方向 2-3 次没有新信息，应换事实槽位、换来源类型或打开候选正文。"
+            "禁止输出推理过程、证据列表、来源说明、历史策略中的实体或工具调用文本。"
+            "如果本轮作答，只返回题目要求的最短答案字段。"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": self._build_user_content(case)},
+            {"role": "user", "content": retry_text},
+        ]
+
+    def _extract_pseudo_tool_calls(
+        self, content: str, reasoning_content: str = ""
+    ) -> list[dict[str, Any]]:
+        """Recover XML-like tool calls that some models emit as plain text."""
+        text = "\n".join(part for part in (content, reasoning_content) if part)
+        if "<tool_call" not in text and "<function=" not in text:
+            return []
+        calls: list[dict[str, Any]] = []
+        blocks = re.findall(r"<tool_call[^>]*>(.*?)</tool_call>", text, flags=re.S | re.I)
+        if not blocks:
+            blocks = [text]
+        for block in blocks:
+            match = re.search(r"<function=([A-Za-z_][A-Za-z0-9_]*)[^>]*>", block, flags=re.I)
+            if not match:
+                continue
+            name = match.group(1)
+            args: dict[str, Any] = {}
+            for key, raw_value in re.findall(
+                r"<parameter=([A-Za-z_][A-Za-z0-9_]*)[^>]*>(.*?)</parameter>",
+                block,
+                flags=re.S | re.I,
+            ):
+                args[key] = self._coerce_pseudo_arg(raw_value)
+            if not args:
+                json_match = re.search(r"\{.*\}", block, flags=re.S)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(0))
+                        if isinstance(parsed, dict):
+                            args = parsed
+                    except json.JSONDecodeError:
+                        args = {}
+            calls.append(
+                {
+                    "id": f"pseudo_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+        return calls
+
+    def _coerce_pseudo_arg(self, value: str) -> Any:
+        value = re.sub(r"\s+", " ", (value or "").strip())
+        lower = value.lower()
+        if lower in {"true", "false"}:
+            return lower == "true"
+        if re.fullmatch(r"-?\d+", value):
+            try:
+                return int(value)
+            except ValueError:
+                return value
+        if re.fullmatch(r"-?\d+\.\d+", value):
+            try:
+                return float(value)
+            except ValueError:
+                return value
+        return value
 
     def _dump_tool_call(self, tc: Any) -> dict[str, Any]:
         if hasattr(tc, "model_dump"):
@@ -791,6 +1871,334 @@ class HarnessOrchestrator:
             args = {}
         return name, args, tc_id
 
+    def _new_tool_state(self) -> dict[str, Any]:
+        return {
+            "search_calls": 0,
+            "search_keys": {},
+            "search_seen_refs": {},
+            "stale_searches": 0,
+            "browser_failed_urls": {},
+            "browser_last_errors": {},
+        }
+
+    def _tool_call_key(self, fn_name: str, fn_args: dict[str, Any]) -> str:
+        if fn_name == "search_text":
+            query = re.sub(r"\s+", " ", str(fn_args.get("query") or "").strip().lower())
+            return f"search_text:{query}"
+        if fn_name == "search_image":
+            image = str(fn_args.get("image_url") or fn_args.get("image") or "").strip()
+            return f"search_image:{_canonical_url(image) if _is_http_url(image) else image}"
+        try:
+            return f"{fn_name}:{json.dumps(fn_args, ensure_ascii=False, sort_keys=True)}"
+        except TypeError:
+            return f"{fn_name}:{fn_args}"
+
+    def _precheck_tool_call(
+        self, fn_name: str, fn_args: dict[str, Any], tool_state: dict[str, Any]
+    ) -> str:
+        if fn_name.startswith("search_"):
+            search_calls = int(tool_state.get("search_calls", 0))
+            if search_calls >= max(1, self.config.max_search_calls_per_case):
+                return (
+                    f"search_budget_exhausted: already used {search_calls} search calls in this case. "
+                    "Stop searching and return the best concise final answer from existing observations."
+                )
+            if int(tool_state.get("stale_searches", 0)) >= max(1, self.config.search_stale_result_limit):
+                return (
+                    "stale_search_loop_blocked: recent searches returned no new references. "
+                    "Change strategy substantially or return the best concise final answer from existing observations."
+                )
+            key = self._tool_call_key(fn_name, fn_args)
+            if int(tool_state.get("search_keys", {}).get(key, 0)) >= 1:
+                return (
+                    "repeated_search_blocked: this search query/image was already attempted. "
+                    "Use existing observations, change strategy, or answer now."
+                )
+
+        if fn_name == "browser_navigate":
+            canonical = _canonical_url(str(fn_args.get("url") or ""))
+            if canonical and int(tool_state.get("browser_failed_urls", {}).get(canonical, 0)) >= max(
+                1, self.config.browser_url_failure_limit
+            ):
+                last_error = tool_state.get("browser_last_errors", {}).get(canonical, "previous browser failure")
+                return (
+                    f"browser_url_blocked: same URL already failed via browser ({last_error[:220]}). "
+                    "Do not retry this URL; use search_text, another source URL, or answer from existing observations."
+                )
+        return ""
+
+    def _record_tool_outcome(
+        self,
+        fn_name: str,
+        fn_args: dict[str, Any],
+        error: str,
+        tool_state: dict[str, Any],
+    ) -> None:
+        if fn_name.startswith("search_"):
+            tool_state["search_calls"] = int(tool_state.get("search_calls", 0)) + 1
+            key = self._tool_call_key(fn_name, fn_args)
+            search_keys = tool_state.setdefault("search_keys", {})
+            search_keys[key] = int(search_keys.get(key, 0)) + 1
+
+        if fn_name == "browser_navigate" and error and self._is_browser_url_failure(error):
+            canonical = _canonical_url(str(fn_args.get("url") or ""))
+            if canonical:
+                failed_urls = tool_state.setdefault("browser_failed_urls", {})
+                failed_urls[canonical] = int(failed_urls.get(canonical, 0)) + 1
+                tool_state.setdefault("browser_last_errors", {})[canonical] = error
+        elif fn_name == "browser_parallel" and error and self._is_browser_url_failure(error):
+            failed_urls = tool_state.setdefault("browser_failed_urls", {})
+            last_errors = tool_state.setdefault("browser_last_errors", {})
+            for url in fn_args.get("urls") or []:
+                canonical = _canonical_url(str(url))
+                if canonical:
+                    failed_urls[canonical] = int(failed_urls.get(canonical, 0)) + 1
+                    last_errors[canonical] = error
+
+    def _is_browser_url_failure(self, error: str) -> bool:
+        text = (error or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "http 500",
+                "500",
+                "502",
+                "503",
+                "504",
+                "401",
+                "403",
+                "timeout",
+                "timed out",
+                "session",
+                "connection",
+                "navigate failed",
+                "proxy-error",
+            )
+        )
+
+    def _should_force_answer_after_tool_error(self, tool_result: str, error: str) -> bool:
+        text = f"{error or ''} {tool_result or ''}".lower()
+        markers = (
+            "search_budget_exhausted",
+            "stale_search_results",
+            "repeated_search_blocked",
+            "browser_url_blocked",
+            "stale_search_loop_blocked",
+        )
+        return any(marker in text for marker in markers)
+
+    def _tool_guidance_result(
+        self,
+        fn_name: str,
+        error: str,
+        fn_args: dict[str, Any],
+        tool_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        guidance = "Stop this tool path and answer from existing evidence if possible."
+        if fn_name.startswith("browser_"):
+            guidance = (
+                "Browser failed for this URL before. Do not retry the same URL; "
+                "use search_text with title/domain keywords, try a different source, or answer from observations."
+            )
+        elif fn_name.startswith("search_"):
+            guidance = (
+                "Search budget or duplicate-search guard fired. Stop searching; "
+                "use gathered snippets/visual evidence and return the most likely short answer."
+            )
+        return {
+            "ok": False,
+            "error": error,
+            "fn_name": fn_name,
+            "fn_args": fn_args,
+            "tool_state": {
+                "search_calls": tool_state.get("search_calls", 0),
+                "stale_searches": tool_state.get("stale_searches", 0),
+                "browser_failed_urls": tool_state.get("browser_failed_urls", {}),
+            },
+            "harness_guidance": guidance,
+        }
+
+    def _dispatch_tool_with_recovery(
+        self,
+        fn_name: str,
+        fn_args: dict[str, Any],
+        case: TaskCase,
+        tool_state: dict[str, Any] | None = None,
+    ) -> tuple[Any, str]:
+        if fn_name == "search_image":
+            fn_args = self._normalize_search_image_args(fn_args, case)
+        raw_result = self.env.dispatch(fn_name, fn_args)
+        error = self.env.result_error(raw_result)
+        if fn_name.startswith("search_") and not error and tool_state is not None:
+            raw_result, error = self._enforce_search_novelty(raw_result, tool_state)
+        if (
+            fn_name == "search_image"
+            and error
+            and (case.image_url or case.image)
+        ):
+            recovery_attempts = self._search_image_recovery_args(fn_args, case)
+            recovery_results = []
+            for retry_args in recovery_attempts:
+                retry_result = self.env.dispatch(fn_name, retry_args)
+                retry_error = self.env.result_error(retry_result)
+                recovery_results.append(
+                    {
+                        "args": retry_args,
+                        "error": retry_error,
+                        "result": retry_result,
+                    }
+                )
+                if not retry_error:
+                    if tool_state is not None:
+                        filtered_result, novelty_error = self._enforce_search_novelty(
+                            retry_result, tool_state
+                        )
+                        if novelty_error:
+                            retry_error = novelty_error
+                            retry_result = filtered_result
+                            recovery_results[-1]["error"] = retry_error
+                            recovery_results[-1]["result"] = retry_result
+                            continue
+                        retry_result = filtered_result
+                        recovery_results[-1]["result"] = retry_result
+                    return {
+                        "ok": True,
+                        "recovered_by": "search_image_available_image",
+                        "original_args": fn_args,
+                        "original_error": error,
+                        "recovery_results": recovery_results,
+                    }, ""
+            if recovery_results:
+                return {
+                    "ok": False,
+                    "recovered_by": "search_image_available_image",
+                    "original_args": fn_args,
+                    "original_error": error,
+                    "recovery_results": recovery_results,
+                }, str(recovery_results[-1].get("error") or error)
+        return raw_result, error
+
+    def _enforce_search_novelty(
+        self, raw_result: Any, tool_state: dict[str, Any]
+    ) -> tuple[Any, str]:
+        entries = self._search_result_entries(raw_result)
+        if not entries:
+            return raw_result, ""
+
+        seen_refs = tool_state.setdefault("search_seen_refs", {})
+        seen_domains = tool_state.setdefault("search_seen_domains", {})
+        new_entries = []
+        duplicate_count = 0
+        result_domains: list[str] = []
+        for entry in entries:
+            ref = self._search_result_ref(entry)
+            if ref and ref in seen_refs:
+                duplicate_count += 1
+                continue
+            new_entries.append(entry)
+            if ref:
+                seen_refs[ref] = int(seen_refs.get(ref, 0)) + 1
+            domain = self._search_result_domain(entry)
+            if domain:
+                result_domains.append(domain)
+                seen_domains[domain] = int(seen_domains.get(domain, 0)) + 1
+
+        if result_domains:
+            tool_state["last_result_domains"] = result_domains
+
+        if not new_entries:
+            tool_state["stale_searches"] = int(tool_state.get("stale_searches", 0)) + 1
+            return {
+                "ok": False,
+                "error": "stale_search_results: all returned URLs/titles were already seen in this case",
+                "duplicate_results": duplicate_count,
+                "seen_reference_count": len(seen_refs),
+                "harness_guidance": (
+                    "Do not repeat equivalent search terms. Use missing attributes, exclude seen domains, "
+                    "try a different source/language, or stop searching and answer from existing evidence."
+                ),
+            }, "stale_search_results"
+
+        tool_state["stale_searches"] = 0
+        filtered = self._replace_search_result_entries(raw_result, new_entries)
+        if isinstance(filtered, dict):
+            filtered.setdefault("harness_novelty", {})
+            filtered["harness_novelty"].update(
+                {
+                    "new_results": len(new_entries),
+                    "duplicate_results_filtered": duplicate_count,
+                    "seen_reference_count": len(seen_refs),
+                }
+            )
+        return filtered, ""
+
+    def _search_result_entries(self, raw_result: Any) -> list[dict[str, Any]]:
+        if isinstance(raw_result, list):
+            return [item for item in raw_result if isinstance(item, dict)]
+        if isinstance(raw_result, dict) and isinstance(raw_result.get("results"), list):
+            return [item for item in raw_result["results"] if isinstance(item, dict)]
+        return []
+
+    def _replace_search_result_entries(
+        self, raw_result: Any, entries: list[dict[str, Any]]
+    ) -> Any:
+        if isinstance(raw_result, list):
+            return entries
+        if isinstance(raw_result, dict) and isinstance(raw_result.get("results"), list):
+            return {**raw_result, "results": entries}
+        return raw_result
+
+    def _search_result_ref(self, entry: dict[str, Any]) -> str:
+        url = str(entry.get("url") or entry.get("link") or "").strip()
+        if url:
+            return f"url:{_canonical_url(url) if _is_http_url(url) else url.lower()}"
+        title = re.sub(r"\s+", " ", str(entry.get("title") or "").strip().lower())
+        snippet = re.sub(r"\s+", " ", str(entry.get("snippet") or "").strip().lower())
+        if title:
+            return f"title:{title}"
+        if snippet:
+            return f"snippet:{snippet[:160]}"
+        return ""
+
+    def _search_result_domain(self, entry: dict[str, Any]) -> str:
+        url = str(entry.get("url") or entry.get("link") or "").strip()
+        return _url_domain(url) if url else ""
+
+    def _normalize_search_image_args(
+        self, fn_args: dict[str, Any], case: TaskCase
+    ) -> dict[str, Any]:
+        normalized = dict(fn_args)
+        image_url = str(normalized.get("image_url") or "").strip()
+        image = str(normalized.get("image") or "").strip()
+        if image_url and not _is_http_url(image_url):
+            normalized.pop("image_url", None)
+            normalized.setdefault("image", image_url)
+            image_url = ""
+        if case.image_url and (not image_url or image_url != case.image_url):
+            normalized["image_url"] = case.image_url
+            normalized.pop("image", None)
+            return normalized
+        if not image_url and not image and case.image:
+            normalized["image"] = case.image
+        return normalized
+
+    def _search_image_recovery_args(
+        self, fn_args: dict[str, Any], case: TaskCase
+    ) -> list[dict[str, Any]]:
+        base_args = {
+            key: value
+            for key, value in fn_args.items()
+            if key in {"top_k", "fetch", "max_chars"}
+        }
+        attempts: list[dict[str, Any]] = []
+        if case.image_url and fn_args.get("image_url") != case.image_url:
+            attempts.append({**base_args, "image_url": case.image_url})
+        if case.image and fn_args.get("image") != case.image:
+            attempts.append({**base_args, "image": case.image})
+        if case.image_url and case.image and fn_args.get("image") != case.image:
+            attempts.append({**base_args, "image": case.image})
+        return attempts
+
     def _judge_success(self, pred: str, answer: str) -> bool:
         if not answer:
             return bool(pred.strip())
@@ -798,15 +2206,252 @@ class HarnessOrchestrator:
         a = _normalize_answer(answer)
         return bool(a and (p == a or a in p))
 
+    def _eval_status(self, pred: str, answer: str) -> str:
+        if not self._has_parseable_prediction(pred):
+            return "no_prediction"
+        if not (answer or "").strip():
+            return "unknown"
+        return "correct" if self._judge_success(pred, answer) else "incorrect"
+
+    def _memory_outcome(self, eval_status: str, has_pred: bool) -> str | None:
+        if eval_status == "correct":
+            return "success"
+        if eval_status in {"incorrect", "no_prediction"}:
+            return "failure"
+        if not has_pred:
+            return "failure"
+        return None
+
     def extract_pred(self, answer: str) -> str:
         return _normalize_answer(answer) or answer.strip()
 
     def _extract_model_pred(self, answer: str) -> str:
         return self.extract_pred(answer) if self._has_parseable_prediction(answer) else ""
 
+    def _candidate_text_for_review(self, answer: str) -> str:
+        extracted = self.extract_pred(answer)
+        if extracted:
+            return extracted
+        return (answer or "").strip()
+
     def _has_parseable_prediction(self, answer: str) -> bool:
         stripped = (answer or "").strip()
+        if self._extract_pseudo_tool_calls(stripped):
+            return False
+        if self._is_non_answer_prediction(answer):
+            return False
+        if self._is_explanatory_or_long_prediction(answer):
+            return False
         return bool(self.extract_pred(answer)) and not stripped.upper().startswith("[HARNESS]")
+
+    def _needs_answer_repair(self, answer: str) -> bool:
+        if not (answer or "").strip():
+            return True
+        if not self._has_parseable_prediction(answer):
+            return True
+        return self._is_explanatory_or_long_prediction(answer)
+
+    def _answer_repair_reason(self, answer: str) -> str:
+        if not (answer or "").strip():
+            return "empty_answer"
+        if self._is_non_answer_prediction(answer):
+            return "non_answer_refusal"
+        if self._is_explanatory_or_long_prediction(answer):
+            return "verbose_or_explanatory_answer"
+        return "unknown"
+
+    def _is_non_answer_prediction(self, answer: str) -> bool:
+        pred = self.extract_pred(answer).lower()
+        if not pred:
+            return False
+        non_answer_patterns = (
+            r"^\s*https?://",
+            r"^\s*www\.",
+            r"\bunable\s+to\b",
+            r"\bunable\b.*\b(identify|determine|verify|find|answer)\b",
+            r"\bcannot\b.*\b(identify|determine|verify|find|answer)\b",
+            r"\bcan\s+not\b.*\b(identify|determine|verify|find|answer)\b",
+            r"\bcan't\b.*\b(identify|determine|verify|find|answer)\b",
+            r"\bnot\s+able\s+to\b",
+            r"\bno\s+definitive\b",
+            r"\bnot\s+possible\s+to\b",
+            r"\bwith\s+certainty\b",
+            r"^\s*unknown\b",
+            r"\binformation\s+insufficient\b",
+            r"\binsufficient\s+(evidence|search|results|verification|information)\b",
+            r"\bnot\s+provided\b",
+            r"\bnot\s+explicitly\s+stated\b",
+            r"\bnot\s+enough\s+(evidence|context|search results)\b",
+        )
+        if any(re.search(pattern, pred) for pattern in non_answer_patterns):
+            return True
+        non_answer_markers = (
+            "unable to answer",
+            "cannot answer",
+            "can't answer",
+            "can not answer",
+            "cannot determine",
+            "can't determine",
+            "not enough information",
+            "insufficient information",
+            "insufficient evidence",
+            "information insufficient",
+            "available information",
+            "current information",
+            "available search results",
+            "current search results",
+            "given constraints",
+            "no definitive",
+            "definitive match",
+            "definitively identify",
+            "search timed out",
+            "tool timed out",
+            "tool failed",
+            "tools failed",
+            "timeout",
+            "无法回答",
+            "不能回答",
+            "无法确定",
+            "无法判断",
+            "无法验证",
+            "无法得出",
+            "信息不足",
+            "证据不足",
+            "搜索超时",
+            "工具失败",
+            "工具超时",
+            "无法访问",
+        )
+        return any(marker in pred for marker in non_answer_markers)
+
+    def _is_explanatory_or_long_prediction(self, answer: str) -> bool:
+        pred = self.extract_pred(answer).strip()
+        if not pred:
+            return False
+        low = pred.lower()
+        words = re.findall(r"[\w'-]+", pred, flags=re.U)
+        if len(pred) > 140 or len(words) > 14:
+            return True
+        explanatory_markers = (
+            "based on the search results",
+            "based on the clues",
+            "based on available",
+            "the answer is likely",
+            "the most likely",
+            "most likely **",
+            "though definitive",
+            "requires additional verification",
+            "without more detailed",
+            "without definitive",
+            "i cannot",
+            "i can't",
+            "i am unable",
+            "not provided",
+            "not explicitly stated",
+            "information insufficient",
+            "available information",
+            "current information",
+            "no definitive",
+            "definitive match",
+            "definitively identify",
+        )
+        return any(marker in low for marker in explanatory_markers)
+
+    def _write_force_answer_prompt(self, traj: Trajectory, step_id: int) -> None:
+        marker = f"force_answer_prompt:{step_id}"
+        for row in traj.read_all():
+            if row.get("event_type") == marker:
+                return
+        traj.write_event(
+            marker,
+            {"reason": "last_or_recovery_step_forces_final_answer"},
+            step_id=step_id,
+        )
+        traj.write(
+            Role.USER,
+            FORCE_ANSWER_PROMPT,
+            step_id=step_id,
+        )
+
+    def _handle_case_memory_answer_issue(
+        self,
+        *,
+        case: TaskCase,
+        traj: Trajectory,
+        task_kind: str,
+        records: list[RetrievalRecord],
+        bad_answer: str,
+        issue_type: str,
+        step_id: int,
+        applied_context: list[str] | None = None,
+    ) -> dict[str, Any]:
+        review_candidate = self._candidate_text_for_review(bad_answer)
+        review = self.case_memory.review_candidate_answer(
+            instruction=case.instruction,
+            task_type=task_kind,
+            records=records,
+            candidate_answer=review_candidate,
+            issue_type=issue_type,
+            applied_memory_context=applied_context or [],
+        )
+        traj.write_event(
+            "case_memory_candidate_answer_review",
+            {
+                "issue_type": issue_type,
+                "review": review,
+                "candidate_answer_preview": self._compact_text(review_candidate, 500),
+                "raw_candidate_preview": self._compact_text(bad_answer, 500),
+            },
+            step_id=step_id,
+        )
+        if not bool(review.get("accept")):
+            retry_context = self.case_memory.build_retry_context(
+                instruction=case.instruction,
+                task_type=task_kind,
+                records=records,
+                candidate_answer=bad_answer,
+                issue_type=issue_type,
+                applied_memory_context=applied_context or [],
+            )
+            traj.write_event(
+                "case_memory_retry_context",
+                retry_context,
+                step_id=step_id,
+            )
+            traj.write(
+                Role.USER,
+                build_answer_issue_retry_prompt(
+                    review_block=str(retry_context.get("context") or ""),
+                    issue_type=str(review.get("issue_type") or issue_type),
+                ),
+                step_id=step_id,
+            )
+            review["clean_retry_messages"] = self._build_clean_answer_issue_retry_messages(
+                case=case,
+                system_prompt=self.inject_historical_guidelines(SYSTEM_PROMPT, applied_context or []),
+                records=records,
+                retry_context=str(retry_context.get("context") or ""),
+                issue_type=str(review.get("issue_type") or issue_type),
+                candidate_answer=bad_answer,
+            )
+        return review
+
+    def _is_retrieval_tool(self, fn_name: str) -> bool:
+        return fn_name.startswith("search_") or fn_name.startswith("browser_")
+
+    def _answer_issue_type(self, answer: str) -> str:
+        if self._extract_pseudo_tool_calls(answer):
+            return "tool_call_leak"
+        if not (answer or "").strip():
+            return "no_answer"
+        if self._is_non_answer_prediction(answer):
+            return "uncertain_answer"
+        if self._is_explanatory_or_long_prediction(answer):
+            return "overbroad_answer"
+        stripped = (answer or "").strip()
+        if stripped.startswith("{") and "final_answer" not in stripped:
+            return "wrong_format"
+        return "wrong_requested_field"
 
     def _append_reason(self, current: str, extra: str) -> str:
         if not extra:
@@ -831,7 +2476,7 @@ class HarnessOrchestrator:
                 reflection.root_cause,
             ]
         )
-        return sorted(set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.lower())))[:80]
+        return sorted(set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", text.lower())))[:80]
 
     # ------------------------------------------------------------------
     # Exports
@@ -869,29 +2514,36 @@ class HarnessOrchestrator:
         trajectory_dir: Optional[str] = None,
         resume: bool = False,
         continue_on_error: Optional[bool] = None,
+        workers: int = 1,
     ) -> list[dict[str, Any]]:
         results = []
         output_path = output_path or str(Path(self.config.result_dir) / "predictions.jsonl")
         continue_on_error = self.config.batch_continue_on_error if continue_on_error is None else continue_on_error
-        completed_indices = self._read_completed_indices(output_path) if resume else set()
+        completed_indices = self._read_completed_indices(
+            output_path, valid_only=self.config.resume_valid_only
+        ) if resume else set()
         status_counts: dict[str, int] = {}
         if Path(output_path).exists() and not resume:
             Path(output_path).unlink()
+        cases: list[TaskCase] = []
         for case in self.load_next_case():
             if case.index < start:
                 continue
             if case.index in completed_indices:
                 logger.info("case %s skipped because output already exists", case.task_id)
                 continue
-            if limit is not None and len(results) >= limit:
+            if limit is not None and len(cases) >= limit:
                 break
+            cases.append(case)
+
+        def process_case(case: TaskCase) -> dict[str, Any]:
             try:
-                result = self.run_case(case, trajectory_dir=trajectory_dir)
+                return self.run_case(case, trajectory_dir=trajectory_dir)
             except Exception as exc:
                 if not continue_on_error:
                     raise
                 logger.error("case %s failed with uncaught exception: %s", case.task_id, exc, exc_info=True)
-                result = {
+                return {
                     "task_id": case.task_id or f"case_{case.index}",
                     "answer": "",
                     "pred": "",
@@ -899,6 +2551,8 @@ class HarnessOrchestrator:
                     "trajectory_path": "",
                     "summary": {},
                     "success": False,
+                    "has_pred": False,
+                    "eval_status": "no_prediction",
                     "failure_reason": f"{type(exc).__name__}: {exc}",
                     "exit_status": f"uncaught_{type(exc).__name__}",
                     "api_calls": 0,
@@ -908,6 +2562,8 @@ class HarnessOrchestrator:
                     "applied_rules": [],
                     "traceback": traceback.format_exc(),
                 }
+
+        def record_result(case: TaskCase, result: dict[str, Any]) -> None:
             export_image = case.metadata.get("submission_image") if isinstance(case.metadata, dict) else None
             self.export_logs(
                 output_path,
@@ -927,6 +2583,18 @@ class HarnessOrchestrator:
                 result["steps"],
                 result["pred"][:120],
             )
+
+        workers = max(1, int(workers or 1))
+        if workers == 1:
+            for case in cases:
+                record_result(case, process_case(case))
+            return results
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_case = {executor.submit(process_case, case): case for case in cases}
+            for future in as_completed(future_to_case):
+                case = future_to_case[future]
+                record_result(case, future.result())
         return results
 
     def _write_batch_status(
@@ -942,7 +2610,7 @@ class HarnessOrchestrator:
         }
         status_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _read_completed_indices(self, output_path: str) -> set[int]:
+    def _read_completed_indices(self, output_path: str, valid_only: bool = False) -> set[int]:
         path = Path(output_path)
         if not path.exists():
             return set()
@@ -955,6 +2623,8 @@ class HarnessOrchestrator:
             except json.JSONDecodeError:
                 continue
             if isinstance(row.get("index"), int):
+                if valid_only and not self._has_parseable_prediction(str(row.get("pred") or "")):
+                    continue
                 completed.add(row["index"])
         return completed
 

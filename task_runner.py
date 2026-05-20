@@ -5,16 +5,22 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import os
 from pathlib import Path
+import time
 
 try:
     from evo_agent.config import HarnessConfig
     from evo_agent.dreamer import MemoryDreamer
     from evo_agent.harness import HarnessOrchestrator, run_task
+    from evo_agent.judge import JudgeConfig, judge_predictions
+    from evo_agent.submission import export_group_submission
 except ImportError:
     from .evo_agent.config import HarnessConfig
     from .evo_agent.dreamer import MemoryDreamer
     from .evo_agent.harness import HarnessOrchestrator, run_task
+    from .evo_agent.judge import JudgeConfig, judge_predictions
+    from .evo_agent.submission import export_group_submission
 
 
 logging.basicConfig(
@@ -35,9 +41,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--image-url", default=None, help="Online input image URL")
 
     p.add_argument("--task-file", default=None, help="CSV/JSONL task file for batch run")
+    p.add_argument("--image-dir", default=None, help="Base directory for relative image paths in JSONL tasks")
     p.add_argument("--output", default=None, help="Prediction JSONL output path")
     p.add_argument("--limit", type=int, default=None, help="Optional batch limit")
     p.add_argument("--start", type=int, default=0, help="Start index for batch run")
+    p.add_argument("--workers", type=int, default=1, help="Number of cases to run concurrently")
+    p.add_argument("--run-id", default=None, help="Optional run ID used for per-run outputs and memory")
+    p.add_argument("--shared-memory", action="store_true", help="Use MEMORY_DB_PATH/global memory instead of per-run batch memory")
+    p.add_argument("--fresh-memory", action="store_true", help="Reset this run's per-run memory before starting")
     p.add_argument("--resume", action="store_true", help="Append to output and skip existing indices")
     p.add_argument("--strict", action="store_true", help="Stop batch immediately on uncaught per-case errors")
     p.add_argument("--dream-memory", action="store_true", help="Consolidate failed trajectories into memory")
@@ -45,6 +56,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dream-report", default=None, help="Dream memory report JSON path")
     p.add_argument("--dream-limit", type=int, default=None, help="Max recent trajectories to review")
     p.add_argument("--dream-min-failures", type=int, default=None, help="Minimum failed trajectories before writing memory")
+
+    p.add_argument("--judge-after-run", action="store_true", help="Run LLM-as-a-judge scoring after batch predictions")
+    p.add_argument("--judge-file", default=None, help="Existing prediction JSONL to score without running tasks")
+    p.add_argument("--judge-output", default=None, help="Judge detail JSONL output path")
+    p.add_argument("--judge-llm-url", default=None, help="OpenAI-compatible judge base URL; /v1 is appended if omitted")
+    p.add_argument("--judge-model", default=None, help="Judge model name")
+    p.add_argument("--judge-limit", type=int, default=None, help="Optional judge row limit")
+    p.add_argument("--judge-start", type=int, default=0, help="Start index for judging")
+    p.add_argument("--judge-resume", action="store_true", help="Append judge output and skip existing indices")
+    p.add_argument("--group-id", default=None, help="Group id; when set, export group_{id}.json/csv/zip after batch")
+    p.add_argument("--submission-dir", default=None, help="Directory for group submission files")
+    p.add_argument("--submission-from", default=None, help="Existing prediction JSONL to export without running tasks")
+    p.add_argument("--submission-benchmark", default=None, help="Benchmark CSV for submission export; defaults to --task-file")
+    p.add_argument("--submission-traj-dir", default=None, help="Trajectory dir for submission export; defaults to --traj-dir/config")
     return p.parse_args()
 
 
@@ -92,18 +117,90 @@ def main() -> None:
         run_dream_memory()
         return
 
+    def run_judge(prediction_path: str) -> dict:
+        judge_config = JudgeConfig()
+        if args.judge_llm_url:
+            judge_config.base_url = args.judge_llm_url
+        if args.judge_model:
+            judge_config.model_name = args.judge_model
+        summary = judge_predictions(
+            prediction_path=prediction_path,
+            output_path=args.judge_output,
+            config=judge_config,
+            limit=args.judge_limit,
+            start=args.judge_start,
+            resume=args.judge_resume,
+        )
+        print(
+            "Judge complete: "
+            f"{summary['correct']}/{summary['total']} correct, "
+            f"accuracy={summary['accuracy']:.4f}"
+        )
+        print(f"Judge output: {summary['judge_output_path']}")
+        return summary
+
+    if args.judge_file and not args.task_file:
+        run_judge(args.judge_file)
+        return
+
+    def export_submission(prediction_path: str, benchmark_path: str) -> dict:
+        if not args.group_id:
+            raise SystemExit("--group-id is required for submission export")
+        summary = export_group_submission(
+            prediction_path=prediction_path,
+            benchmark_path=args.submission_benchmark or benchmark_path,
+            trajectory_dir=args.submission_traj_dir or args.traj_dir or config.trajectory_dir,
+            group_id=args.group_id,
+            output_dir=args.submission_dir or config.result_dir,
+        )
+        print(
+            "Submission export complete: "
+            f"{summary['answered']}/{summary['total_questions']} answered"
+        )
+        print(f"Submission CSV: {summary['csv_path']}")
+        print(f"Submission JSON: {summary['json_path']}")
+        print(f"Submission ZIP: {summary['zip_path']}")
+        if summary["missing_answer_indices"]:
+            print(f"Missing answers: {summary['missing_answer_indices']}")
+        if summary["missing_trajectory_indices"]:
+            print(f"Missing trajectories: {summary['missing_trajectory_indices']}")
+        return summary
+
+    if args.submission_from and not args.task_file:
+        benchmark_path = args.submission_benchmark
+        if not benchmark_path:
+            raise SystemExit("--submission-benchmark is required with --submission-from")
+        export_submission(args.submission_from, benchmark_path)
+        return
+
     if args.task_file:
-        orch = HarnessOrchestrator(task_file=args.task_file, config=config)
+        prediction_output = args.output or str(Path(config.result_dir) / "predictions.jsonl")
+        if not args.shared_memory and not os.getenv("MEMORY_DB_PATH"):
+            run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+            memory_dir = Path(prediction_output).resolve().parent / "run_memories"
+            config.memory_db_path = str(memory_dir / f"memory_{run_id}.json")
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            memory_path = Path(config.memory_db_path)
+            if args.fresh_memory:
+                memory_path.write_text("[]", encoding="utf-8")
+            elif not memory_path.exists():
+                memory_path.write_text("[]", encoding="utf-8")
+        orch = HarnessOrchestrator(task_file=args.task_file, image_dir=args.image_dir, config=config)
         results = orch.run_file(
-            output_path=args.output,
+            output_path=prediction_output,
             limit=args.limit,
             start=args.start,
             trajectory_dir=args.traj_dir,
             resume=args.resume,
             continue_on_error=not args.strict,
+            workers=args.workers,
         )
         print(f"Batch complete: {len(results)} cases")
-        print(f"Output: {args.output or Path(config.result_dir) / 'predictions.jsonl'}")
+        print(f"Output: {prediction_output}")
+        if args.group_id:
+            export_submission(prediction_output, args.task_file)
+        if args.judge_after_run:
+            run_judge(prediction_output)
         if args.dream_after_run or args.dream_memory:
             run_dream_memory()
         return

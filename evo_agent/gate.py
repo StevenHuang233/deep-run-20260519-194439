@@ -1,4 +1,4 @@
-"""Physical tool gate middleware for loop and error interception."""
+"""Physical tool gate middleware for persistent tool-error interception."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ class ToolGateBlocked(RuntimeError):
 
 
 class ToolGateMiddleware:
-    """Detect repeated tool calls and persistent tool failures.
+    """Track tool calls and block only persistent infrastructure failures.
 
-    The first threshold detects likely no-progress loops. The critical threshold
-    is a second, OpenClaw-style hard cap for exact or near-exact repetitions.
+    CZ Track-D relies on prompt-level guidance for similar/repeated searches.
+    Keep this middleware out of semantic query decisions so it does not cut off
+    legitimate adjacent searches in multi-hop tasks.
     """
 
     def __init__(
@@ -35,7 +36,7 @@ class ToolGateMiddleware:
         self.loop_warning_count = 0
 
     def _tokens(self, text: str) -> set[str]:
-        return set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.lower()))
+        return set(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", text.lower()))
 
     def _calculate_jaccard(self, str1: str, str2: str) -> float:
         words1 = self._tokens(str1)
@@ -53,31 +54,6 @@ class ToolGateMiddleware:
         call = self._canonical_call(tool_name, arguments)
         self.call_history.append(call)
         self.call_history = self.call_history[-self.history_size :]
-        if len(self.call_history) < self.loop_limit:
-            return True
-
-        recent = self.call_history[-self.loop_limit :]
-        similarities = [
-            self._calculate_jaccard(recent[i], recent[i + 1])
-            for i in range(len(recent) - 1)
-        ]
-        if similarities and min(similarities) >= self.similarity_threshold:
-            self.loop_warning_count += 1
-            raise ToolGateBlocked(
-                "repeated tool calls detected: "
-                f"last_{self.loop_limit}_jaccard={similarities}"
-            )
-        critical_recent = self.call_history[-self.critical_limit :]
-        if len(critical_recent) >= self.critical_limit:
-            first = critical_recent[0]
-            if all(
-                self._calculate_jaccard(first, other) >= self.similarity_threshold
-                for other in critical_recent[1:]
-            ):
-                raise ToolGateBlocked(
-                    "critical repeated tool-call loop detected: "
-                    f"critical_limit={self.critical_limit}"
-                )
         return True
 
     def track_error(self, tool_name: str, error_message: str) -> None:
@@ -116,7 +92,7 @@ class ToolGateMiddleware:
             return
 
         self.error_tracker[tool_name] += 1
-        if hard_error or self.error_tracker[tool_name] >= 2:
+        if self.error_tracker[tool_name] >= 3:
             raise ToolGateBlocked(
                 f"persistent tool error for {tool_name}: {error_message[:300]}"
             )

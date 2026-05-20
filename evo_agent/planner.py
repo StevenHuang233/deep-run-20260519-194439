@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .prompts import build_historical_guidelines_prompt
+
 
 class Planner:
     """Task planner facade.
@@ -11,15 +13,7 @@ class Planner:
     """
 
     def inject_historical_guidelines(self, system_prompt: str, rules: list[str]) -> str:
-        if not rules:
-            return system_prompt
-        lines = "\n".join(f"- {rule}" for rule in rules)
-        return (
-            f"{system_prompt}\n"
-            "<historical_guidelines>\n"
-            f"{lines}\n"
-            "</historical_guidelines>"
-        )
+        return build_historical_guidelines_prompt(system_prompt, rules)
 
     def task_kind(self, instruction: str, has_image: bool = False) -> str:
         text = instruction.lower()

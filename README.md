@@ -73,6 +73,21 @@ python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_har
 python -m evo_harness_oop.task_runner --task-file benchmark.csv --output evo_harness_oop/outputs/benchmark_predictions.jsonl --resume
 ```
 
+批量运行默认会给每次 run 创建独立 memory，位置在输出文件同目录的
+`run_memories/memory_<run_id>.json`。同一次 run 内的样本共享该 memory；
+下一次 50 条、100 条运行会自动用新的 memory，互不覆盖。需要复用全局
+`MEMORY_DB_PATH` 时加 `--shared-memory`，需要固定本轮 memory 名称时加
+`--run-id my_run_001`。
+
+并发运行：
+
+```bash
+python -m task_runner --task-file "$SIMPLEVQA_FILE" --image-dir "$SIMPLEVQA_IMAGE_DIR" --workers 2
+```
+
+并发时同一个 run 内仍共享同一个 memory，memory 读写在进程内加锁，避免同进程
+`--workers` 并发写入冲突；不要同时启动两个独立进程写同一个 `MEMORY_DB_PATH`。
+
 默认批量运行会在单个样本出现未捕获异常时继续处理后续样本，并生成
 `benchmark_predictions.jsonl.status.json` 状态摘要。需要遇错立即停止时使用：
 
@@ -155,6 +170,9 @@ export CONTEXT_RECENT_STEPS=8
 export LLM_RETRY_ATTEMPTS=3
 export LLM_RETRY_MIN_SECONDS=1
 export LLM_RETRY_MAX_SECONDS=8
+export TOOL_RETRY_ATTEMPTS=3
+export TOOL_RETRY_MIN_SECONDS=1
+export TOOL_RETRY_MAX_SECONDS=8
 export MEMORY_MAX_RULES=64
 export BATCH_CONTINUE_ON_ERROR=1
 export MIN_MODEL_ATTEMPTS=5
@@ -165,4 +183,32 @@ export CASE_REFLECTION_ATTEMPTS=4
 
 ```bash
 python -m unittest discover -s tests
+```
+
+## SimpleVQA 本地图片与 LLM Judge
+
+SimpleVQA JSONL 中的本地 `image` 会通过 `--image-dir` 读取为视觉输入；`image_url` 会保留给 `search_image` 做反向图搜。
+
+```bash
+cd /inspire/qb-ilm2/project/26summer-camp-01/26210500/evo_harness_oop
+export SIMPLEVQA_FILE=/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets/simpleVQA/SimpleVQA.jsonl
+export SIMPLEVQA_IMAGE_DIR=/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets/simpleVQA
+export JUDGE_LLM_BASE_URL=https://notebook-inspire.sii.edu.cn/ws-7c23bd1d-9bae-4238-803a-737a35480e18/project-39fbffc7-dcca-4fb4-b43a-2f69f72f7e52/user-b1acf6ce-25a4-4cb6-b428-f427f4a59686/vscode/b2aa27b1-e0f7-425d-b208-acbd7f40ef68/68f1224c-8cc9-4e87-8701-523c6e59db1f/proxy/8001
+export JUDGE_MODEL_NAME=Qwen3-32B
+
+MOCK_LLM=1 python -m task_runner \
+  --task-file "$SIMPLEVQA_FILE" \
+  --image-dir "$SIMPLEVQA_IMAGE_DIR" \
+  --limit 2 \
+  --output outputs/simplevqa_mock_predictions.jsonl \
+  --judge-after-run \
+  --judge-output outputs/simplevqa_mock_judge.jsonl
+```
+
+已有预测文件可单独评分：
+
+```bash
+python -m task_runner \
+  --judge-file outputs/simplevqa_predictions.jsonl \
+  --judge-output outputs/simplevqa_judge.jsonl
 ```

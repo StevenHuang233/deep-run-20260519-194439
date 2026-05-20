@@ -35,6 +35,10 @@ class Reflection:
     memory_worthy: bool
     clin_rule: str
     confidence: str = "should"
+    compiler_source: str = "heuristic"
+    compiler_model: str = ""
+    compiler_error: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -44,4 +48,8 @@ class Reflection:
             "memory_worthy": self.memory_worthy,
             "clin_rule": self.clin_rule,
             "confidence": self.confidence,
+            "compiler_source": self.compiler_source,
+            "compiler_model": self.compiler_model,
+            "compiler_error": self.compiler_error,
+            "metadata": self.metadata,
         }

@@ -19,10 +19,12 @@ class BenchmarkRunner:
         limit: int | None = None,
         start: int = 0,
         trajectory_dir: str | None = None,
+        workers: int = 1,
     ) -> list[dict]:
         return self.orchestrator.run_file(
             output_path=output_path,
             limit=limit,
             start=start,
             trajectory_dir=trajectory_dir,
+            workers=workers,
         )

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+outputs/
+trajectories/
+case_memory_records.jsonl
+usage_logs.jsonl
+memory.json
+memory_backup.jsonl
