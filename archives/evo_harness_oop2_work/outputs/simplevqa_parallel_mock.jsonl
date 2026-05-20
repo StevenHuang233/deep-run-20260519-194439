@@ -1,0 +1,2 @@
+{"index": 0, "instruction": "图中人物是哪一年因肺结核去世的？", "image": "/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets/simpleVQA/CCSimpleQA/82.jpg", "answer": "1934年", "pred": "1934年"}
+{"index": 1, "instruction": "What is the name of this bridge?", "image": "/inspire/qb-ilm2/project/26summer-camp-01/26210500/datasets/simpleVQA/MMEbench/landmark/00fa476690a260a8.jpg", "answer": "Bathampton Toll Bridge", "pred": "bathampton toll bridge"}

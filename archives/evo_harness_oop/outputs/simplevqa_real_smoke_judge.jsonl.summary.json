@@ -1,0 +1,9 @@
+{
+  "total": 1,
+  "correct": 0,
+  "accuracy": 0.0,
+  "judge_model": "Qwen3-32B",
+  "prediction_path": "outputs/simplevqa_real_smoke.jsonl",
+  "judge_output_path": "outputs/simplevqa_real_smoke_judge.jsonl",
+  "processed_this_run": 1
+}
