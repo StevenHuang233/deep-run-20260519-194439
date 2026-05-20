@@ -1468,7 +1468,11 @@ class HarnessOrchestrator:
                 "max_tokens": min(self.config.max_tokens, 512),
                 "response_format": _FINAL_ANSWER_RESPONSE_FORMAT,
             }
-            self._apply_main_model_sampling(request_kwargs, enable_thinking=False)
+            request_kwargs["temperature"] = 0.1
+            request_kwargs["extra_body"] = {
+                "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
             try:
                 if self.client is None:
                     raise RuntimeError("OpenAI client is unavailable")
@@ -2189,6 +2193,23 @@ class HarnessOrchestrator:
 
     def _extract_model_pred(self, answer: str) -> str:
         return self.extract_pred(answer) if self._has_parseable_prediction(answer) else ""
+
+    def _select_previous_answer(self, traj: Trajectory) -> str:
+        for record in reversed(traj.read_all()):
+            if record.get("role") != Role.ASSISTANT.value:
+                continue
+            content = str(record.get("content") or "").strip()
+            if content and not self._extract_pseudo_tool_calls(content):
+                return content
+        for record in reversed(traj.read_all()):
+            if record.get("role") != Role.ASSISTANT.value:
+                continue
+            answer = self._extract_explicit_answer_from_text(
+                str(record.get("reasoning_content") or "")
+            )
+            if answer:
+                return answer
+        return ""
 
     def _candidate_text_for_review(self, answer: str) -> str:
         extracted = self.extract_pred(answer)

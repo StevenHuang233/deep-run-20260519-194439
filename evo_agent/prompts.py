@@ -292,18 +292,9 @@ SHORT_ANSWER_REPAIR_PROMPT = (
 # Purpose: last-resort no-tool answer extraction prompt from existing observations.
 def build_forced_evidence_answer_prompt(*, task: str, failure_reason: str, evidence: str) -> str:
     return (
-        "[HARNESS_FORCED_EVIDENCE_ANSWER]\n"
-        "所有常规尝试都没有产出有效提交答案。现在不要再调用工具。"
-        "请基于题目、图片、已有 search/browser Observation、候选实体和本轮修正策略，给出一个最可能的简短答案。"
-        "先确认题目只问哪个字段：年份、地点、人物、实体、数量、颜色、yes/no 或比较结果；最终只输出这个字段。"
-        "不要把工具失败、URL、证据句、推理过程或无关中间实体当答案。"
-        "现在必须作出选择：在已有文本里找最接近目标字段的候选实体/日期/数量/名称，选择一个提交。"
-        "不要输出任何语言的“未知、没找到、无法确定、信息不足、没有结果、No se encontró、Unknown、not found”等状态描述；这些会被判为无答案。"
-        "如果候选有多个，优先选择出现频率高、离题目目标字段最近、或来自标题/摘要/正文明确字段的候选。\n"
-        "只返回题目要求的最短答案字段；不要输出 <answer> 标签、Markdown、解释、证据列表或工具失败文本。\n\n"
-        f"Task:\n{task}\n\n"
-        f"Failure reason:\n{failure_reason or 'none'}\n\n"
-        f"Evidence and candidates:\n{evidence}"
+        "请基于题目和图片直接给出最终答案。不要再调用工具，不要写工具调用文本。"
+        "只返回 JSON：{\"final_answer\":\"你的答案\"}。"
+        "答案字段只写最短答案，不要解释、不要 Markdown、不要 <answer> 标签。"
     )
 
 
